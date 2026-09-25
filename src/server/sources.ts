@@ -1,11 +1,10 @@
 import type { Source } from "./types.js";
 
 export const SOURCES: Source[] = [
-  // 애니
+  // 애니 (natalie.mu 는 AWS WAF 캡차로 서버 요청이 막혀서 제거)
   { kind: "rss", name: "Anime News Network", url: "https://www.animenewsnetwork.com/all/rss.xml", cat: "anime" },
   { kind: "rss", name: "Anime Corner", url: "https://animecorner.me/feed/", cat: "anime" },
   { kind: "rss", name: "MyAnimeList", url: "https://myanimelist.net/rss/news.xml", cat: "anime" },
-  { kind: "rss", name: "コミックナタリー", url: "https://natalie.mu/comic/feed/news", cat: "anime" },
 
   // 게임
   { kind: "rss", name: "Gematsu", url: "https://www.gematsu.com/feed", cat: "game" },
@@ -14,10 +13,14 @@ export const SOURCES: Source[] = [
   { kind: "rss", name: "Game Spark", url: "https://www.gamespark.jp/rss/index.rdf", cat: "game" },
 
   // JPOP
-  { kind: "rss", name: "音楽ナタリー", url: "https://natalie.mu/music/feed/news", cat: "jpop" },
+  {
+    kind: "rss", name: "Real Sound", url: "https://realsound.jp/atom.xml", cat: "jpop",
+    filter: "JPOP|アニメソング|ボカロ|アイドル|男性グループ|女性グループ|バンド|シンガーソングライター|ユニット",
+  },
+  { kind: "rss", name: "JROCK NEWS", url: "https://jrocknews.com/feed", cat: "jpop" },
   { kind: "rss", name: "ARAMA! JAPAN", url: "https://aramajapan.com/feed/", cat: "jpop" },
 
-  // 해외 커뮤니티
+  // 커뮤니티
   { kind: "reddit", name: "r/anime", sub: "anime", cat: "anime" },
   { kind: "reddit", name: "r/gachagaming", sub: "gachagaming", cat: "game" },
   { kind: "reddit", name: "r/JRPG", sub: "JRPG", cat: "game" },

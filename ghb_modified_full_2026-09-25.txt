@@ -1,0 +1,2703 @@
+==================================================================
+ 서브컬처 매거진 봇 - AI 답변대로 수정한 코드 전문
+ 기준: github.com/kangsm8321-ai/ghb  (genspark_ai_developer 브랜치)
+ PR:   https://github.com/kangsm8321-ai/ghb/pull/1
+ 생성: 2026-09-25 18:48:21
+==================================================================
+
+[수정/추가된 파일 목록]
+  M  src/server/types.ts      (Source.filter, Pending, Job/ServerConfig 필드)
+  M  src/server/sources.ts    (J-POP 소스 교체)
+  M  src/server/collect.ts    (Atom 카테고리 + Reddit RSS 폴백)
+  M  src/server/images.ts     (로고 필터 + 후보 저장)
+  M  src/server/render.ts     (위치·크기 조절)
+  M  src/server/telegram.ts   (멀티파트 헬퍼)
+  A  src/server/instagram.ts  (신규)
+  A  src/server/video.ts      (신규)
+  M  server.ts                (텔레그램 흐름 전체)
+  M  package.json / .env.example
+
+════════════════════════════════════════════════════════════════
+### FILE: src/server/types.ts
+════════════════════════════════════════════════════════════════
+export type Cat = "anime" | "game" | "jpop";
+
+export type Source =
+  | { kind: "rss"; name: string; url: string; cat: Cat; filter?: string }
+  | { kind: "reddit"; name: string; sub: string; cat: Cat };
+
+export type Article = {
+  title: string;
+  link: string;
+  date: number;
+  snippet: string;
+  source: string;
+  cat: Cat;
+  score?: number;
+  images: string[];
+  titleKo?: string;
+  snippetKo?: string;
+};
+
+export type Topic = {
+  idx: number;
+  title: string;
+  angle: string;
+  why: string;
+  cat: Cat;
+  entity: string; // 공식 원제 (영문/일문): 이미지 API 검색용
+  sourceName?: string;
+  sourceUrl?: string;
+  articleImages?: string[];
+};
+
+export type SlideStyle = {
+  aspectRatio?: "4:5" | "1:1" | "9:16" | "16:9" | "custom";
+  width?: number;
+  height?: number;
+  imageRatio?: number; // 0.3 ~ 1.0 (배경 이미지 높이 점유율, 기본 1.0)
+  imageFit?: "cover" | "contain"; // 기본 "cover"
+  imageScale?: number; // 1.0 ~ 2.0 확대 (기본 1.0)
+  imagePosition?: "attention" | "top" | "center" | "bottom";
+  imageOffsetX?: number; // 0 ~ 100% (기본 50)
+  imageOffsetY?: number; // 0 ~ 100% (기본 50)
+  overlayOpacity?: number; // 0.0 ~ 1.0 어두움 오버레이 (기본 0.85)
+  customImageUrl?: string;
+};
+
+export type Pending =
+  | { kind: "photo"; slideIdx: number }
+  | { kind: "editText"; slideIdx: number }
+  | { kind: "addPage"; afterIdx: number }
+  | { kind: "caption" }
+  | { kind: "music" };
+
+export type SlideContent = {
+  headline: string;
+  body: string;
+  imageQuery: string;
+  style?: SlideStyle;
+};
+
+export type JobStatus =
+  | "idle"
+  | "collecting"
+  | "proposing"
+  | "generating"
+  | "review"
+  | "published"
+  | "canceled"
+  | "error";
+
+export type Job = {
+  id: string;
+  createdAt: number;
+  status: JobStatus;
+  topic?: Topic;
+  topics?: Topic[];
+  slides?: SlideContent[];
+  slideStyles?: SlideStyle[];
+  cardRatio?: "4:5" | "1:1" | "9:16" | "16:9" | "custom";
+  customWidth?: number;
+  customHeight?: number;
+  caption?: string;
+  slideImgs?: (Buffer | null)[];
+  slideImgUrls?: string[];
+  imageFiles?: string[];
+  renderedSlideDataUrls?: string[];
+  usedImageUrls?: string[];
+  slideCandidates?: string[][];
+  candidateCursor?: number[];
+  pending?: Pending;
+  music?: { name: string; start: number };
+  videoFile?: string;
+  error?: string;
+};
+
+export type ServerConfig = {
+  telegramBotToken: string;
+  telegramChatId: string;
+  telegramSecret: string;
+  publicBaseUrl: string;
+  tgMode: "webhook" | "polling" | "off";
+  cronSecret: string;
+  handle: string;
+  braveApiKey: string;
+  maxAgeHours: number;
+  textModel: string;
+  igUserId: string;
+  igAccessToken: string;
+};
+
+export type LogEntry = {
+  id: string;
+  time: string;
+  level: "info" | "warn" | "error" | "success";
+  message: string;
+};
+
+
+════════════════════════════════════════════════════════════════
+### FILE: src/server/sources.ts
+════════════════════════════════════════════════════════════════
+import type { Source } from "./types.js";
+
+export const SOURCES: Source[] = [
+  // 애니 (natalie.mu 는 AWS WAF 캡차로 서버 요청이 막혀서 제거)
+  { kind: "rss", name: "Anime News Network", url: "https://www.animenewsnetwork.com/all/rss.xml", cat: "anime" },
+  { kind: "rss", name: "Anime Corner", url: "https://animecorner.me/feed/", cat: "anime" },
+  { kind: "rss", name: "MyAnimeList", url: "https://myanimelist.net/rss/news.xml", cat: "anime" },
+
+  // 게임
+  { kind: "rss", name: "Gematsu", url: "https://www.gematsu.com/feed", cat: "game" },
+  { kind: "rss", name: "AUTOMATON", url: "https://automaton-media.com/en/feed/", cat: "game" },
+  { kind: "rss", name: "Siliconera", url: "https://www.siliconera.com/feed/", cat: "game" },
+  { kind: "rss", name: "Game Spark", url: "https://www.gamespark.jp/rss/index.rdf", cat: "game" },
+
+  // JPOP
+  {
+    kind: "rss", name: "Real Sound", url: "https://realsound.jp/atom.xml", cat: "jpop",
+    filter: "JPOP|アニメソング|ボカロ|アイドル|男性グループ|女性グループ|バンド|シンガーソングライター|ユニット",
+  },
+  { kind: "rss", name: "JROCK NEWS", url: "https://jrocknews.com/feed", cat: "jpop" },
+  { kind: "rss", name: "ARAMA! JAPAN", url: "https://aramajapan.com/feed/", cat: "jpop" },
+
+  // 커뮤니티
+  { kind: "reddit", name: "r/anime", sub: "anime", cat: "anime" },
+  { kind: "reddit", name: "r/gachagaming", sub: "gachagaming", cat: "game" },
+  { kind: "reddit", name: "r/JRPG", sub: "JRPG", cat: "game" },
+  { kind: "reddit", name: "r/jpop", sub: "jpop", cat: "jpop" },
+];
+
+
+════════════════════════════════════════════════════════════════
+### FILE: src/server/collect.ts
+════════════════════════════════════════════════════════════════
+import Parser from "rss-parser";
+import { GoogleGenAI } from "@google/genai";
+import { SOURCES } from "./sources.js";
+import type { Article, Cat } from "./types.js";
+
+export const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+export const extractImgs = (html: string, base?: string): string[] =>
+  [...html.matchAll(/<img[^>]+(?:data-src|src)=["']([^"']+)["']/gi)]
+    .map((m) => {
+      try {
+        return new URL(m[1], base).href;
+      } catch {
+        return "";
+      }
+    })
+    .filter(
+      (u) =>
+        u &&
+        !/logo|avatar|icon|emoji|sprite|gravatar|pixel|banner|ads?\/|\.svg/i.test(u)
+    );
+
+const parser = new Parser({
+  timeout: 12000,
+  headers: { "User-Agent": UA },
+  customFields: {
+    item: [
+      ["media:content", "media"],
+      ["media:thumbnail", "thumb"],
+      ["content:encoded", "encoded"],
+      ["category", "atomCats", { keepArray: true }],
+    ],
+  },
+});
+
+async function fromRss(
+  s: Extract<(typeof SOURCES)[number], { kind: "rss" }>
+): Promise<Article[]> {
+  const feed = await parser.parseURL(s.url);
+  const re = s.filter ? new RegExp(s.filter, "i") : null;
+  return feed.items
+    .filter((it: any) => {
+      if (!re) return true;
+      const cats = [
+        ...(it.categories ?? []),
+        ...(it.atomCats ?? []).map((c: any) => c?.$?.term ?? c?.$?.label ?? c),
+      ]
+        .filter((x: any) => typeof x === "string")
+        .join(" ");
+      return re.test(`${it.title} ${cats}`);
+    })
+    .map((it: any) => ({
+      title: (it.title || "").trim(),
+      link: it.link || "",
+      date: Date.parse(it.isoDate || it.pubDate || "") || Date.now(),
+      snippet: (it.contentSnippet || it.summary || "").slice(0, 300),
+      source: s.name,
+      cat: s.cat,
+      images: [
+        it.enclosure?.url,
+        it.media?.$?.url,
+        it.thumb?.$?.url,
+        ...extractImgs(it.encoded || it.content || "", it.link),
+      ].filter(Boolean) as string[],
+    }));
+}
+
+async function fromReddit(
+  s: Extract<(typeof SOURCES)[number], { kind: "reddit" }>
+): Promise<Article[]> {
+  const res = await fetch(
+    `https://www.reddit.com/r/${s.sub}/top.json?t=day&limit=25`,
+    {
+      headers: { "User-Agent": "subcul-mag/1.0 (subculture news monitor)" },
+      signal: AbortSignal.timeout(10000),
+    }
+  );
+  if (res.ok) {
+    const json: any = await res.json();
+    return (json.data?.children ?? [])
+      .map((c: any) => c.data)
+      .filter((d: any) => !d.stickied)
+      .map((d: any) => ({
+        title: d.title,
+        link: `https://www.reddit.com${d.permalink}`,
+        date: (d.created_utc || Date.now() / 1000) * 1000,
+        snippet: (d.selftext || d.url_overridden_by_dest || "").slice(0, 300),
+        source: `Reddit r/${s.sub}`,
+        cat: s.cat,
+        score: d.score,
+        images: (d.preview?.images ?? [])
+          .map((i: any) => (i.source?.url || "").replace(/&amp;/g, "&"))
+          .filter(Boolean),
+      }));
+  }
+  // 클라우드 IP 차단(403/429)이면 RSS로 한 번 더 시도
+  const feed = await parser.parseURL(`https://www.reddit.com/r/${s.sub}/top/.rss?t=day`);
+  return feed.items.map((it: any) => ({
+    title: (it.title || "").trim(),
+    link: it.link || "",
+    date: Date.parse(it.isoDate || "") || Date.now(),
+    snippet: (it.contentSnippet || "").slice(0, 300),
+    source: `Reddit r/${s.sub}`,
+    cat: s.cat,
+    images: extractImgs(it.content || "", it.link),
+  }));
+}
+
+// X 트렌드 및 최신 화제: Gemini + Google Search Grounding (쿼터 보호 캐시 탑재)
+let cachedXTrends: Article[] = [];
+let lastXTrendsFetch = 0;
+let xTrendsQuotaCooldownUntil = 0;
+
+export async function fromXTrends(
+  ai: GoogleGenAI,
+  model: string,
+  log?: (m: string) => void
+): Promise<Article[]> {
+  const now = Date.now();
+
+  // 1시간 내 캐시가 있거나, 쿼터 제한 쿨다운 상태인 경우 API 호출 없이 캐시 반환
+  if (now < xTrendsQuotaCooldownUntil || (cachedXTrends.length > 0 && now - lastXTrendsFetch < 60 * 60 * 1000)) {
+    return cachedXTrends;
+  }
+
+  try {
+    const res = await ai.models.generateContent({
+      model,
+      contents: `최근 24시간 동안 X(트위터) 일본·한국·영미권에서 화제가 된 애니메이션/서브컬처 게임/J-POP 공식 발표 뉴스 6~8개를 조사하여 순수 JSON 배열만 출력하세요:
+[
+  {
+    "title": "뉴스 제목(한국어 또는 원문)",
+    "url": "해당 소식 링크(공식 X 또는 뉴스 URL)",
+    "cat": "anime 또는 game 또는 jpop",
+    "summary": "1~2문장 요약"
+  }
+]`,
+      config: {
+        tools: [{ googleSearch: {} }],
+      },
+    });
+
+    const txt = (res.text ?? "").replace(/```json|```/g, "").trim();
+    const startIdx = txt.indexOf("[");
+    const endIdx = txt.lastIndexOf("]");
+    if (startIdx === -1 || endIdx === -1) return cachedXTrends;
+
+    const arr = JSON.parse(txt.slice(startIdx, endIdx + 1));
+    const items = (arr ?? []).map((a: any) => ({
+      title: a.title || "X 실시간 트렌드 화제 소식",
+      link: a.url || `https://x.com/search?q=${encodeURIComponent(a.title || "")}`,
+      date: Date.now(),
+      snippet: a.summary || "",
+      source: "X 트렌드 (실시간 탐색)",
+      cat: (["anime", "game", "jpop"].includes(a.cat) ? a.cat : "anime") as Cat,
+      images: [],
+    }));
+
+    if (items.length > 0) {
+      cachedXTrends = items;
+      lastXTrendsFetch = now;
+    }
+    return cachedXTrends;
+  } catch (err: any) {
+    const isQuotaError =
+      err.message?.includes("429") ||
+      err.message?.includes("RESOURCE_EXHAUSTED") ||
+      err.message?.includes("quota");
+
+    if (isQuotaError) {
+      // 1시간 동안 쿼터 보호 모드로 전환하여 재호출 차단
+      xTrendsQuotaCooldownUntil = Date.now() + 60 * 60 * 1000;
+      log?.("💡 X 트렌드: Gemini 검색 쿼터 절약을 위해 RSS 및 커뮤니티 소스 중심으로 자동 전환되었습니다.");
+    } else {
+      console.warn("X 트렌드 수집 안내:", err.message);
+    }
+    return cachedXTrends;
+  }
+}
+
+import { translateArticlesToKorean } from "./translate.js";
+
+const seen = new Set<string>();
+export const markUsed = (link: string) => seen.add(link);
+
+export async function collectAll(
+  ai: GoogleGenAI,
+  model: string,
+  maxAgeHours: number,
+  log: (msg: string) => void
+): Promise<Article[]> {
+  log("📡 서브컬처 뉴스 수집을 시작합니다 (RSS / Reddit / X)...");
+
+  const tasks: Promise<Article[]>[] = SOURCES.map((s) =>
+    (s.kind === "rss" ? fromRss(s) : fromReddit(s))
+      .then((items) => {
+        log(`✔ ${s.name}: ${items.length}건 수집 완료`);
+        return items;
+      })
+      .catch((e) => {
+        log(`✖ ${s.name}: ${e.message}`);
+        return [] as Article[];
+      })
+  );
+
+  tasks.push(
+    fromXTrends(ai, model, log)
+      .then((items) => {
+        if (items.length) log(`✔ X 트렌드 검색: ${items.length}건 수집 완료`);
+        return items;
+      })
+      .catch(() => [] as Article[])
+  );
+
+  const nested = await Promise.all(tasks);
+  const all = nested.flat();
+  const cutoff = Date.now() - maxAgeHours * 3600_000;
+  const norm = (t: string) =>
+    t.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "").slice(0, 40);
+
+  const dedup = new Map<string, Article>();
+  for (const a of all) {
+    if (!a.title || !a.link || a.date < cutoff || seen.has(a.link)) continue;
+    const k = norm(a.title);
+    if (!dedup.has(k)) {
+      dedup.set(k, a);
+    }
+  }
+
+  const result = [...dedup.values()].sort((a, b) => b.date - a.date).slice(0, 60);
+  log(`총 ${result.length}건의 중복 없는 최신 기사가 준비되었습니다.`);
+
+  // 한국어 번역 적용
+  const translated = await translateArticlesToKorean(ai, model, result, log);
+  return translated;
+}
+
+
+════════════════════════════════════════════════════════════════
+### FILE: src/server/images.ts
+════════════════════════════════════════════════════════════════
+import sharp from "sharp";
+import { UA, extractImgs } from "./collect.js";
+import type { Topic } from "./types.js";
+
+const enc = encodeURIComponent;
+
+const getJson = async (u: string, h: Record<string, string> = {}) => {
+  try {
+    const r = await fetch(u, {
+      headers: { "User-Agent": UA, ...h },
+      signal: AbortSignal.timeout(8000),
+    });
+    return r.ok ? await r.json() : null;
+  } catch {
+    return null;
+  }
+};
+
+// ── 소스별 이미지 후보 수집 ──
+
+const BLOCK_HOSTS = [
+  "google.com",
+  "gstatic.com",
+  "googleusercontent.com",
+  "googleapis.com",
+  "vertexaisearch.cloud.google.com",
+  "x.com",
+  "twitter.com",
+  "abs.twimg.com",
+  "redditstatic.com",
+  "facebook.com",
+];
+
+export function isBlockedImageUrl(u: string): boolean {
+  try {
+    const url = new URL(u);
+    const h = url.hostname;
+    if (BLOCK_HOSTS.some((b) => h === b || h.endsWith("." + b))) return true;
+    return /logo|favicon|icon|avatar|sprite|placeholder|noimage|no_image|default[-_]?(og|share|image)|\.svg(\?|$)|\.gif(\?|$)/i.test(
+      url.pathname
+    );
+  } catch {
+    return true;
+  }
+}
+
+const isBlockedPage = (u: string) =>
+  /(^|\.)(google\.com|x\.com|twitter\.com)$/i.test(new URL(u).hostname);
+
+async function articleImages(link?: string): Promise<string[]> {
+  if (!link) return [];
+  try {
+    if (isBlockedPage(link) && !/vertexaisearch/.test(link)) return [];
+    const res = await fetch(link, {
+      headers: { "User-Agent": UA },
+      redirect: "follow",
+      signal: AbortSignal.timeout(6000),
+    });
+    // 리다이렉트 후에도 구글/X 페이지면 og:image 가 로고이므로 쓰지 않음
+    if (!res.ok || isBlockedPage(res.url)) return [];
+    const html = await res.text();
+    const og = [
+      ...html.matchAll(
+        /<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]+content=["']([^"']+)/gi
+      ),
+    ].map((m) => m[1]);
+    const body = html.match(/<article[\s\S]*?<\/article>/i)?.[0] ?? html;
+    return [...og, ...extractImgs(body, res.url)]
+      .filter((u) => !isBlockedImageUrl(u))
+      .slice(0, 15);
+  } catch {
+    return [];
+  }
+}
+
+// 애니: MyAnimeList 비공식 Jikan API (API 키 불필요)
+async function jikan(q: string): Promise<string[]> {
+  if (!q) return [];
+  try {
+    const s = await getJson(`https://api.jikan.moe/v4/anime?q=${enc(q)}&limit=2`);
+    const a = s?.data?.[0];
+    if (!a) return [];
+    const p = await getJson(`https://api.jikan.moe/v4/anime/${a.mal_id}/pictures`);
+    const pics = (p?.data ?? []).map((x: any) => x.jpg?.large_image_url || x.jpg?.image_url);
+    return [
+      a.images?.jpg?.large_image_url || a.images?.jpg?.image_url,
+      ...pics,
+    ].filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// 게임: Steam 공식 스토어 API 스크린샷
+async function steam(q: string): Promise<string[]> {
+  if (!q) return [];
+  try {
+    const s = await getJson(
+      `https://store.steampowered.com/api/storesearch/?term=${enc(q)}&l=english&cc=US`
+    );
+    const id = s?.items?.[0]?.id;
+    if (!id) return [];
+    const appDetails = await getJson(
+      `https://store.steampowered.com/api/appdetails?appids=${id}`
+    );
+    const d = appDetails?.[id]?.data;
+    const screenshots = (d?.screenshots ?? []).map((x: any) => x.path_full);
+    const headerImg = d?.header_image;
+    return [headerImg, ...screenshots].filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// JPOP / 음악: iTunes Search API 고해상도 1200x1200bb 앨범 아트
+async function itunes(q: string): Promise<string[]> {
+  if (!q) return [];
+  try {
+    const j = await getJson(
+      `https://itunes.apple.com/search?term=${enc(q)}&country=JP&entity=album&limit=6`
+    );
+    return (j?.results ?? [])
+      .map((r: any) =>
+        r.artworkUrl100
+          ? r.artworkUrl100.replace("100x100bb", "1200x1200bb")
+          : ""
+      )
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// 범용 이미지 검색 (선택사항, BRAVE_API_KEY 환경변수가 있을 때)
+async function brave(q: string, braveKey?: string): Promise<string[]> {
+  const key = braveKey || process.env.BRAVE_API_KEY;
+  if (!key || !q) return [];
+  try {
+    const j = await getJson(
+      `https://api.search.brave.com/res/v1/images/search?q=${enc(q)}&count=12&safesearch=strict`,
+      { "X-Subscription-Token": key, Accept: "application/json" }
+    );
+    return (j?.results ?? []).map((x: any) => x.properties?.url).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// ── 다운로드 + 품질 검사 + 유사 이미지 판별 (dhash) ──
+
+const downloadCache = new Map<string, Buffer | null>();
+
+export async function downloadImage(url: string): Promise<Buffer | null> {
+  if (downloadCache.has(url)) return downloadCache.get(url)!;
+  let out: Buffer | null = null;
+  try {
+    if (!isBlockedImageUrl(url)) {
+      const r = await fetch(url, {
+        headers: { "User-Agent": UA, Referer: new URL(url).origin },
+        signal: AbortSignal.timeout(8000),
+      });
+      const cType = r.headers.get("content-type") || "";
+      if (r.ok && (cType.startsWith("image/") || /\.(jpe?g|png|webp)/i.test(url))) {
+        const b = Buffer.from(await r.arrayBuffer());
+        const m = await sharp(b).metadata();
+        const w = m.width ?? 0,
+          h = m.height ?? 0,
+          ar = w / (h || 1);
+        // 작은 썸네일이나 배너형(너무 가로·세로로 긴) 이미지 제외
+        if (w >= 500 && h >= 350 && ar < 2.6 && ar > 0.4) {
+          // 로고·단색 그래픽은 엔트로피가 낮음 (사진은 보통 6~7.5). 필요하면 기준값 조절
+          const { entropy } = await sharp(b).stats();
+          if (entropy >= 4.5) out = b;
+        }
+      }
+    }
+  } catch {
+    out = null;
+  }
+  downloadCache.set(url, out);
+  return out;
+}
+
+// 64-bit difference hash (dhash 9x8)
+export async function dhash(b: Buffer): Promise<bigint> {
+  try {
+    const px = await sharp(b)
+      .grayscale()
+      .resize(9, 8, { fit: "fill" })
+      .raw()
+      .toBuffer();
+    let h = 0n;
+    for (let y = 0; y < 8; y++) {
+      for (let x = 0; x < 8; x++) {
+        h = (h << 1n) | (px[y * 9 + x] > px[y * 9 + x + 1] ? 1n : 0n);
+      }
+    }
+    return h;
+  } catch {
+    return 0n;
+  }
+}
+
+export const ham = (a: bigint, b: bigint): number => {
+  let x = a ^ b;
+  let c = 0;
+  while (x) {
+    c += Number(x & 1n);
+    x >>= 1n;
+  }
+  return c;
+};
+
+export async function pickSlideImages(
+  topic: Topic,
+  slides: { imageQuery: string }[],
+  excludeUrls: string[] = [],
+  braveKey?: string,
+  log?: (m: string) => void
+): Promise<{ bufs: (Buffer | null)[]; urls: string[]; cands: string[][] }> {
+  log?.(`🖼 "${topic.title}" 슬라이드별 이미지 수집 중...`);
+
+  const fromArticle = [
+    ...(topic.articleImages ?? []),
+    ...(await articleImages(topic.sourceUrl)),
+  ];
+
+  const fromApi =
+    topic.cat === "anime"
+      ? await jikan(topic.entity)
+      : topic.cat === "game"
+      ? await steam(topic.entity)
+      : await itunes(topic.entity);
+
+  const usedHash: bigint[] = [];
+  const usedUrl = new Set<string>(excludeUrls);
+  const bufs: (Buffer | null)[] = [];
+  const urls: string[] = [];
+  const cands: string[][] = [];
+
+  for (let i = 0; i < slides.length; i++) {
+    const isCover = i === 0;
+    // 표지 = 기사 대표 이미지 + 공식 API 우선
+    // 본문 = 슬라이드 검색어 → 공식 API → 기사 이미지 순
+    const braveCands = await brave(
+      `${topic.entity} ${slides[i].imageQuery || ""}`.trim(),
+      braveKey
+    );
+
+    const list = [
+      ...new Set(
+        (isCover
+          ? [...fromArticle, ...fromApi, ...braveCands]
+          : [...braveCands, ...fromApi, ...fromArticle]
+        ).filter((u) => u && !isBlockedImageUrl(u))
+      ),
+    ];
+    cands.push(list); // 텔레그램 "다음 후보 사진" 버튼에서 사용
+
+    let got: Buffer | null = null;
+    let selectedUrl = "";
+
+    for (const u of list) {
+      if (usedUrl.has(u)) continue;
+      const b = await downloadImage(u);
+      if (!b) continue;
+
+      const h = await dhash(b);
+      // 거의 같은 사진이면 건너뜀 (Hamming 거리 8 이하)
+      if (usedHash.some((x) => ham(x, h) <= 8)) continue;
+
+      usedHash.push(h);
+      usedUrl.add(u);
+      selectedUrl = u;
+      got = b;
+      break;
+    }
+
+    bufs.push(got);
+    urls.push(selectedUrl);
+  }
+
+  // 사진이 모자라면: 이미 확보한 사진 풀에서 다른 부분을 크롭하여 슬라이드 채움
+  const pool = bufs.filter(Boolean) as Buffer[];
+  const gravities = ["north", "south", "east", "west", "centre"] as const;
+
+  for (let i = 0; i < bufs.length; i++) {
+    if (!bufs[i] && pool.length > 0) {
+      const src = pool[i % pool.length];
+      const m = await sharp(src).metadata();
+      const w = m.width || 1080;
+      bufs[i] = await sharp(src)
+        .resize(Math.round(w * 1.5), null)
+        .resize(1080, 1350, {
+          fit: "cover",
+          position: gravities[i % gravities.length],
+        })
+        .toBuffer();
+      urls[i] = urls[i % pool.length] || "";
+    }
+  }
+
+  log?.(
+    `✔ ${bufs.filter(Boolean).length}장 배정 (후보 총 ${cands.flat().length}개)`
+  );
+  return { bufs, urls, cands };
+}
+
+
+════════════════════════════════════════════════════════════════
+### FILE: src/server/render.ts
+════════════════════════════════════════════════════════════════
+import sharp from "sharp";
+import path from "path";
+import fs from "fs";
+import { Resvg } from "@resvg/resvg-js";
+import type { Cat, SlideStyle } from "./types.js";
+
+const FONT_PATHS = [
+  path.resolve("fonts/Pretendard-Bold.otf"),
+  path.resolve("fonts/Pretendard-Regular.otf"),
+].filter((f) => fs.existsSync(f));
+
+export const CAT_COLOR: Record<Cat, string> = {
+  anime: "#38bdf8", // Sky blue
+  game: "#a3e635", // Vibrant Lime
+  jpop: "#f472b6", // Neon Pink
+};
+
+export const CAT_LABEL: Record<Cat, string> = {
+  anime: "ANIME",
+  game: "GAME",
+  jpop: "J-POP",
+};
+
+const esc = (s: string) =>
+  (s || "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&apos;",
+  }[c] || c));
+
+// 한글 글자폭(1.0)과 ASCII 글자폭(0.55)을 고려한 문자열 길이 계산
+const vlen = (s: string) =>
+  [...s].reduce((n, c) => n + (/[\x00-\xff]/.test(c) ? 0.55 : 1), 0);
+
+function wrap(text: string, max: number): string[] {
+  const lines: string[] = [];
+  let cur = "";
+  const words = (text || "").split(/\s+/);
+  for (const w of words) {
+    if (cur && vlen(cur + " " + w) > max) {
+      lines.push(cur);
+      cur = w;
+    } else {
+      cur = cur ? `${cur} ${w}` : w;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+export type SlideRenderOpts = {
+  img: Buffer | null;
+  headline: string;
+  body: string;
+  index: number;
+  total: number;
+  cat: Cat;
+  source?: string;
+  handle?: string;
+  style?: SlideStyle;
+  // 단일 오버라이드 옵션
+  width?: number;
+  height?: number;
+  imageRatio?: number; // 0.3 ~ 1.0 (배경 이미지 높이 점유율, 기본 1.0)
+  imageFit?: "cover" | "contain";
+  imageScale?: number; // 1.0 ~ 2.5
+  imagePosition?: "attention" | "top" | "center" | "bottom";
+  imageOffsetY?: number; // 0 ~ 100%
+  overlayOpacity?: number; // 0.0 ~ 1.0
+};
+
+export async function renderSlide(opts: SlideRenderOpts): Promise<Buffer> {
+  const { img, index, total, cat } = opts;
+  const cover = index === 0;
+
+  // 비율 및 해상도 계산 (4:5, 1:1, 9:16, 16:9 또는 custom)
+  const st = opts.style || {};
+  let W = opts.width || st.width || 1080;
+  let H = opts.height || st.height || 1350;
+
+  if (st.aspectRatio === "1:1") {
+    W = 1080;
+    H = 1080;
+  } else if (st.aspectRatio === "9:16") {
+    W = 1080;
+    H = 1920;
+  } else if (st.aspectRatio === "16:9") {
+    W = 1920;
+    H = 1080;
+  } else if (st.aspectRatio === "4:5") {
+    W = 1080;
+    H = 1350;
+  }
+
+  // 배경 이미지 비율 및 컨트롤 속성
+  const imgRatio = Math.max(0.25, Math.min(1.0, opts.imageRatio ?? st.imageRatio ?? 1.0));
+  const imgH = Math.round(H * imgRatio);
+  const fitMode = opts.imageFit || st.imageFit || "cover";
+  const scale = Math.max(1.0, Math.min(2.5, opts.imageScale ?? st.imageScale ?? 1.0));
+  const overlayAlpha = Math.max(0.1, Math.min(1.0, opts.overlayOpacity ?? st.overlayOpacity ?? 0.85));
+  const imagePos = opts.imagePosition || st.imagePosition || "attention";
+
+  const scaleFactor = W / 1080;
+  const isSplitLayout = imgRatio < 0.94;
+
+  const hSize = Math.round((cover ? 74 : 58) * scaleFactor);
+  const hLH = Math.round(hSize * 1.25);
+  const bSize = Math.round((cover ? 36 : 34) * scaleFactor);
+  const bLH = Math.round(bSize * 1.55);
+
+  const maxCharsH = Math.max(10, Math.floor(W / (cover ? 80 : 66)));
+  const maxCharsB = Math.max(18, Math.floor(W / 44));
+
+  const hLines = wrap(opts.headline, maxCharsH);
+  const bLines = wrap(opts.body, maxCharsB);
+
+  // 텍스트 위치 계산
+  const bottom = H - Math.round(110 * scaleFactor);
+  const bodyTop = bottom - bLines.length * bLH;
+  const headTop = isSplitLayout
+    ? Math.max(imgH + Math.round(40 * scaleFactor), bodyTop - Math.round(45 * scaleFactor) - hLines.length * hLH)
+    : bodyTop - Math.round(45 * scaleFactor) - hLines.length * hLH;
+
+  const color = CAT_COLOR[cat] || "#38bdf8";
+  const badgeLabel = cover ? `BREAKING · ${CAT_LABEL[cat]}` : CAT_LABEL[cat];
+  const badgeWidth = Math.round((cover ? 270 : 180) * scaleFactor);
+  const badgeHeight = Math.round(48 * scaleFactor);
+  const badgeRadius = Math.round(badgeHeight / 2);
+
+  // SVG 텍스트 & 그라디언트 오버레이 생성
+  const svg = `<svg width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#05070d" stop-opacity="0"/>
+      <stop offset="0.3" stop-color="#05070d" stop-opacity="${(overlayAlpha * 0.45).toFixed(2)}"/>
+      <stop offset="0.75" stop-color="#05070d" stop-opacity="${(overlayAlpha * 0.92).toFixed(2)}"/>
+      <stop offset="1" stop-color="#05070d" stop-opacity="${overlayAlpha.toFixed(2)}"/>
+    </linearGradient>
+    <linearGradient id="seam" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#080c18" stop-opacity="0"/>
+      <stop offset="1" stop-color="#080c18" stop-opacity="1"/>
+    </linearGradient>
+    <linearGradient id="topShadow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#05070d" stop-opacity="${(overlayAlpha * 0.8).toFixed(2)}"/>
+      <stop offset="1" stop-color="#05070d" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 상단 네비게이션 가독성을 위한 은은한 그림자 -->
+  <rect x="0" y="0" width="${W}" height="${Math.round(200 * scaleFactor)}" fill="url(#topShadow)"/>
+
+  ${
+    isSplitLayout
+      ? `
+    <!-- 이미지 하단 경계 부드러운 그라디언트 페이드 -->
+    <rect x="0" y="${Math.max(0, imgH - Math.round(140 * scaleFactor))}" width="${W}" height="${Math.round(140 * scaleFactor)}" fill="url(#seam)"/>
+    <!-- 텍스트 영역 전용 다크 배경 -->
+    <rect x="0" y="${imgH}" width="${W}" height="${H - imgH}" fill="#080c18"/>
+    <!-- 세련된 네온 구분선 -->
+    <line x1="${Math.round(64 * scaleFactor)}" y1="${imgH}" x2="${W - Math.round(64 * scaleFactor)}" y2="${imgH}" stroke="${color}" stroke-opacity="0.35" stroke-width="2"/>
+    `
+      : `
+    <!-- 풀스크린 텍스트 가독성 그라디언트 -->
+    <rect x="0" y="${Math.max(0, headTop - Math.round(220 * scaleFactor))}" width="${W}" height="${H - Math.max(0, headTop - Math.round(220 * scaleFactor))}" fill="url(#g)"/>
+    `
+  }
+
+  <!-- 상단 카테고리 뱃지 -->
+  <rect x="${Math.round(64 * scaleFactor)}" y="${Math.round(64 * scaleFactor)}" width="${badgeWidth}" height="${badgeHeight}" rx="${badgeRadius}" fill="${color}"/>
+  <text x="${Math.round((64 + badgeWidth / 2) * scaleFactor)}" y="${Math.round(64 * scaleFactor + badgeHeight / 2)}" font-family="Pretendard, sans-serif" font-weight="700" font-size="${Math.round(22 * scaleFactor)}" fill="#05070d" text-anchor="middle" dominant-baseline="central">${esc(badgeLabel)}</text>
+
+  <!-- 슬라이드 페이지 카운터 (예: 01 / 05) -->
+  <text x="${W - Math.round(64 * scaleFactor)}" y="${Math.round(64 * scaleFactor + badgeHeight / 2)}" font-family="Pretendard, sans-serif" font-weight="700" font-size="${Math.round(24 * scaleFactor)}" fill="#ffffff" text-anchor="end" dominant-baseline="central">${String(index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}</text>
+
+  <!-- 헤드라인 강조 액센트 바 -->
+  <rect x="${Math.round(64 * scaleFactor)}" y="${headTop - Math.round(24 * scaleFactor)}" width="${Math.round(88 * scaleFactor)}" height="${Math.round(8 * scaleFactor)}" rx="4" fill="${color}"/>
+
+  <!-- 헤드라인 텍스트 -->
+  ${hLines
+    .map(
+      (l, i) =>
+        `<text x="${Math.round(64 * scaleFactor)}" y="${headTop + hSize + i * hLH}" font-family="Pretendard, sans-serif" font-weight="700" font-size="${hSize}" fill="#ffffff">${esc(l)}</text>`
+    )
+    .join("")}
+
+  <!-- 본문 텍스트 -->
+  ${bLines
+    .map(
+      (l, i) =>
+        `<text x="${Math.round(64 * scaleFactor)}" y="${bodyTop + bSize + i * bLH}" font-family="Pretendard, sans-serif" font-weight="400" font-size="${bSize}" fill="#f1f5f9">${esc(l)}</text>`
+    )
+    .join("")}
+
+  <!-- 푸터: 출처 및 계정 핸들 -->
+  <text x="${Math.round(64 * scaleFactor)}" y="${H - Math.round(55 * scaleFactor)}" font-family="Pretendard, sans-serif" font-size="${Math.round(20 * scaleFactor)}" fill="#94a3b8">${esc(opts.source ? `출처: ${opts.source}` : "")}</text>
+  <text x="${W - Math.round(64 * scaleFactor)}" y="${H - Math.round(55 * scaleFactor)}" font-family="Pretendard, sans-serif" font-weight="700" font-size="${Math.round(22 * scaleFactor)}" fill="#cbd5e1" text-anchor="end">${esc(opts.handle || "@animemag.kr")}</text>
+</svg>`;
+
+  let overlayPng: Buffer;
+  try {
+    const resvg = new Resvg(svg, {
+      font: {
+        fontFiles: FONT_PATHS,
+        loadSystemFonts: false,
+        defaultFontFamily: "Pretendard",
+      },
+    });
+    overlayPng = resvg.render().asPng();
+  } catch (err) {
+    const resvg = new Resvg(svg, {
+      font: {
+        loadSystemFonts: true,
+        defaultFontFamily: "sans-serif",
+      },
+    });
+    overlayPng = resvg.render().asPng();
+  }
+
+  // 배경 이미지 처리
+  let base: Buffer;
+  if (img) {
+    try {
+      let processedImg: Buffer;
+
+      if (fitMode === "contain") {
+        // 배경은 블러 처리된 앰비언트 이미지, 전경은 비율 유지 contain
+        const blurredBg = await sharp(img)
+          .resize(W, imgH, { fit: "cover" })
+          .blur(30)
+          .modulate({ brightness: 0.35 })
+          .toBuffer();
+
+        const containedFg = await sharp(img)
+          .resize(W, imgH, {
+            fit: "contain",
+            background: { r: 0, g: 0, b: 0, alpha: 0 },
+          })
+          .png()
+          .toBuffer();
+
+        processedImg = await sharp(blurredBg)
+          .composite([{ input: containedFg, gravity: "center" }])
+          .toBuffer();
+      } else {
+        // cover 모드: 원본 이미지 전체 범위 안에서 확대하고 X/Y로 이동
+        const offX = st.imageOffsetX;
+        const offY = opts.imageOffsetY ?? st.imageOffsetY;
+        if (scale <= 1.02 && offX === undefined && offY === undefined) {
+          let pos: any = sharp.strategy.attention;
+          if (imagePos === "top") pos = sharp.gravity.north;
+          else if (imagePos === "bottom") pos = sharp.gravity.south;
+          else if (imagePos === "center") pos = sharp.gravity.center;
+          processedImg = await sharp(img)
+            .resize(W, imgH, { fit: "cover", position: pos })
+            .toBuffer();
+        } else {
+          const m = await sharp(img).metadata();
+          const iw = m.width || W,
+            ih = m.height || imgH;
+          const k = Math.max(W / iw, imgH / ih) * scale;
+          const rw = Math.max(W, Math.round(iw * k));
+          const rh = Math.max(imgH, Math.round(ih * k));
+          processedImg = await sharp(img)
+            .resize(rw, rh, { fit: "fill" })
+            .extract({
+              left: Math.round((rw - W) * ((offX ?? 50) / 100)),
+              top: Math.round((rh - imgH) * ((offY ?? 50) / 100)),
+              width: W,
+              height: imgH,
+            })
+            .toBuffer();
+        }
+      }
+
+      if (isSplitLayout) {
+        // 상단에만 이미지를 배치하고 하단은 솔리드 다크 캔버스
+        const canvas = await sharp({
+          create: {
+            width: W,
+            height: H,
+            channels: 3,
+            background: "#080c18",
+          },
+        })
+          .png()
+          .toBuffer();
+
+        base = await sharp(canvas)
+          .composite([{ input: processedImg, top: 0, left: 0 }])
+          .toBuffer();
+      } else {
+        base = processedImg;
+      }
+    } catch {
+      base = await sharp({
+        create: {
+          width: W,
+          height: H,
+          channels: 3,
+          background: "#080c18",
+        },
+      })
+        .png()
+        .toBuffer();
+    }
+  } else {
+    base = await sharp({
+      create: {
+        width: W,
+        height: H,
+        channels: 3,
+        background: "#080c18",
+      },
+    })
+      .png()
+      .toBuffer();
+  }
+
+  return sharp(base)
+    .composite([{ input: overlayPng }])
+    .jpeg({ quality: 92 })
+    .toBuffer();
+}
+
+
+════════════════════════════════════════════════════════════════
+### FILE: src/server/telegram.ts
+════════════════════════════════════════════════════════════════
+export const TG = (token: string, method: string) =>
+  `https://api.telegram.org/bot${token}/${method}`;
+
+export async function sendTelegramMessage(
+  token: string,
+  chatId: string | number,
+  text: string,
+  extra: Record<string, any> = {}
+) {
+  if (!token || !chatId) return { ok: false, description: "Token or Chat ID missing" };
+  try {
+    const res = await fetch(TG(token, "sendMessage"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: String(chatId),
+        text,
+        parse_mode: "HTML",
+        ...extra,
+      }),
+    });
+    return await res.json();
+  } catch (err: any) {
+    return { ok: false, error: err.message };
+  }
+}
+
+// 앨범 미리보기 전송 (Buffer 직접 멀티파트 전송으로 공개 URL 불필요, 최대 10장)
+export async function sendAlbum(
+  token: string,
+  chatId: string | number,
+  bufs: Buffer[],
+  caption: string
+) {
+  if (!token || !chatId || !bufs.length) {
+    return { ok: false, description: "Token, Chat ID or buffers missing" };
+  }
+
+  const validBufs = bufs.slice(0, 10);
+  const fd = new FormData();
+  fd.append("chat_id", String(chatId));
+
+  const media = validBufs.map((_, i) => ({
+    type: "photo",
+    media: `attach://p${i}`,
+    ...(i === 0 ? { caption: caption.slice(0, 1000), parse_mode: "HTML" } : {}),
+  }));
+  fd.append("media", JSON.stringify(media));
+
+  validBufs.forEach((b, i) => {
+    fd.append(
+      `p${i}`,
+      new Blob([new Uint8Array(b)], { type: "image/jpeg" }),
+      `p${i}.jpg`
+    );
+  });
+
+  try {
+    const res = await fetch(TG(token, "sendMediaGroup"), {
+      method: "POST",
+      body: fd,
+    });
+    return await res.json();
+  } catch (err: any) {
+    return { ok: false, error: err.message };
+  }
+}
+
+export async function answerCallbackQuery(
+  token: string,
+  callbackQueryId: string,
+  text?: string
+) {
+  if (!token || !callbackQueryId) return;
+  try {
+    await fetch(TG(token, "answerCallbackQuery"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        callback_query_id: callbackQueryId,
+        text,
+      }),
+    });
+  } catch {}
+}
+
+export async function setupWebhook(
+  token: string,
+  publicBaseUrl: string,
+  secretToken?: string
+) {
+  if (!token || !publicBaseUrl) return { ok: false, description: "Missing token or URL" };
+  const webhookUrl = `${publicBaseUrl.replace(/\/+$/, "")}/tg/webhook`;
+  try {
+    const res = await fetch(TG(token, "setWebhook"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: webhookUrl,
+        secret_token: secretToken || undefined,
+        allowed_updates: ["message", "callback_query"],
+      }),
+    });
+    return await res.json();
+  } catch (err: any) {
+    return { ok: false, error: err.message };
+  }
+}
+
+async function tgMultipart(
+  token: string,
+  method: string,
+  fields: Record<string, any>,
+  files: { field: string; buf: Buffer; name: string; mime: string }[]
+) {
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) {
+    if (v !== undefined) fd.append(k, typeof v === "string" ? v : JSON.stringify(v));
+  }
+  for (const f of files)
+    fd.append(f.field, new Blob([new Uint8Array(f.buf)], { type: f.mime }), f.name);
+  const res = await fetch(TG(token, method), { method: "POST", body: fd });
+  return res.json() as Promise<any>;
+}
+
+export const sendPhoto = (
+  token: string,
+  chatId: string | number,
+  buf: Buffer,
+  caption = "",
+  reply_markup?: any
+) =>
+  tgMultipart(
+    token,
+    "sendPhoto",
+    { chat_id: String(chatId), caption, parse_mode: "HTML", reply_markup },
+    [{ field: "photo", buf, name: "slide.jpg", mime: "image/jpeg" }]
+  );
+
+// 같은 메시지의 사진만 바꿔서 조절할 때마다 새 메시지가 쌓이지 않게 함
+export const editPhoto = (
+  token: string,
+  chatId: string | number,
+  messageId: number,
+  buf: Buffer,
+  caption: string,
+  reply_markup?: any
+) =>
+  tgMultipart(
+    token,
+    "editMessageMedia",
+    {
+      chat_id: String(chatId),
+      message_id: String(messageId),
+      media: { type: "photo", media: "attach://p", caption, parse_mode: "HTML" },
+      reply_markup,
+    },
+    [{ field: "p", buf, name: "slide.jpg", mime: "image/jpeg" }]
+  );
+
+export const sendVideo = (
+  token: string,
+  chatId: string | number,
+  buf: Buffer,
+  caption = "",
+  reply_markup?: any
+) =>
+  tgMultipart(
+    token,
+    "sendVideo",
+    {
+      chat_id: String(chatId),
+      caption,
+      parse_mode: "HTML",
+      supports_streaming: "true",
+      reply_markup,
+    },
+    [{ field: "video", buf, name: "reel.mp4", mime: "video/mp4" }]
+  );
+
+// 텔레그램 Bot API 는 20MB 이하 파일만 내려받을 수 있음
+export async function downloadTelegramFile(
+  token: string,
+  fileId: string
+): Promise<Buffer> {
+  const r: any = await (
+    await fetch(`${TG(token, "getFile")}?file_id=${encodeURIComponent(fileId)}`)
+  ).json();
+  if (!r.ok) throw new Error(r.description || "getFile 실패");
+  const f = await fetch(
+    `https://api.telegram.org/file/bot${token}/${r.result.file_path}`
+  );
+  if (!f.ok) throw new Error(`파일 다운로드 실패 (${f.status})`);
+  return Buffer.from(await f.arrayBuffer());
+}
+
+
+════════════════════════════════════════════════════════════════
+### FILE: src/server/instagram.ts
+════════════════════════════════════════════════════════════════
+const IG = "https://graph.instagram.com/v26.0";
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function igPost(path: string, token: string, params: Record<string, string>) {
+  const res = await fetch(`${IG}/${path}`, {
+    method: "POST",
+    body: new URLSearchParams({ ...params, access_token: token }),
+  });
+  const j: any = await res.json();
+  if (!res.ok || j.error) throw new Error(`IG ${path}: ${j.error?.message || res.status}`);
+  return j;
+}
+
+async function igGet(path: string, token: string, fields: string) {
+  const res = await fetch(`${IG}/${path}?fields=${fields}&access_token=${encodeURIComponent(token)}`);
+  return res.json() as Promise<any>;
+}
+
+async function waitFinished(id: string, token: string, interval = 5000, maxMs = 5 * 60_000) {
+  const until = Date.now() + maxMs;
+  while (Date.now() < until) {
+    const s = await igGet(id, token, "status_code");
+    if (s.status_code === "FINISHED") return;
+    if (s.status_code === "ERROR" || s.status_code === "EXPIRED") throw new Error(`컨테이너 상태: ${s.status_code}`);
+    await sleep(interval);
+  }
+  throw new Error("인스타 컨테이너 처리 시간 초과");
+}
+
+async function publish(igUserId: string, token: string, creationId: string) {
+  const pub = await igPost(`${igUserId}/media_publish`, token, { creation_id: creationId });
+  const info = await igGet(pub.id, token, "permalink");
+  return { id: pub.id as string, permalink: info.permalink as string | undefined };
+}
+
+// imageUrls 는 인스타 서버가 직접 가져가야 하므로 공개 URL + JPEG 이어야 함
+export async function publishCarousel(o: { igUserId: string; token: string; imageUrls: string[]; caption: string }) {
+  const urls = o.imageUrls.slice(0, 10);
+  if (urls.length === 1) {
+    const c = await igPost(`${o.igUserId}/media`, o.token, { image_url: urls[0], caption: o.caption });
+    await waitFinished(c.id, o.token);
+    return publish(o.igUserId, o.token, c.id);
+  }
+  const children: string[] = [];
+  for (const u of urls) {
+    const c = await igPost(`${o.igUserId}/media`, o.token, { image_url: u, is_carousel_item: "true" });
+    await waitFinished(c.id, o.token);
+    children.push(c.id);
+  }
+  const car = await igPost(`${o.igUserId}/media`, o.token, {
+    media_type: "CAROUSEL", children: children.join(","), caption: o.caption,
+  });
+  await waitFinished(car.id, o.token);
+  return publish(o.igUserId, o.token, car.id);
+}
+
+export async function publishReel(o: { igUserId: string; token: string; videoUrl: string; caption: string; audioName?: string }) {
+  const params: Record<string, string> = {
+    media_type: "REELS", video_url: o.videoUrl, caption: o.caption, share_to_feed: "true",
+  };
+  if (o.audioName) params.audio_name = o.audioName.slice(0, 100);
+  const c = await igPost(`${o.igUserId}/media`, o.token, params);
+  await waitFinished(c.id, o.token, 15000, 6 * 60_000);
+  return publish(o.igUserId, o.token, c.id);
+}
+
+
+════════════════════════════════════════════════════════════════
+### FILE: src/server/video.ts
+════════════════════════════════════════════════════════════════
+import { spawn } from "child_process";
+import ffmpegPath from "ffmpeg-static";
+import fs from "fs/promises";
+import os from "os";
+import path from "path";
+
+function run(bin: string, args: string[]) {
+  return new Promise<void>((resolve, reject) => {
+    const p = spawn(bin, args);
+    let err = "";
+    p.stderr.on("data", (d) => (err += d.toString()));
+    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-800)))));
+  });
+}
+
+export async function makeSlideshowReel(
+  slides: Buffer[], audio: Buffer, opts: { secPerSlide?: number; audioStart?: number } = {}
+): Promise<Buffer> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "reel-"));
+  try {
+    const sec = opts.secPerSlide ?? 3;
+    const total = Math.max(6, slides.length * sec);
+    await Promise.all(slides.map((b, i) => fs.writeFile(path.join(dir, `s${String(i).padStart(2, "0")}.jpg`), b)));
+    await fs.writeFile(path.join(dir, "audio"), audio);
+    const out = path.join(dir, "out.mp4");
+    await run(ffmpegPath as unknown as string, [
+      "-y", "-framerate", `1/${sec}`, "-i", path.join(dir, "s%02d.jpg"),
+      "-ss", String(opts.audioStart ?? 0), "-i", path.join(dir, "audio"),
+      "-vf",
+      `scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=0x080c18,fps=30,tpad=stop_mode=clone:stop_duration=${sec},format=yuv420p`,
+      "-af", `apad,afade=t=out:st=${total - 1.5}:d=1.5`,
+      "-map", "0:v", "-map", "1:a", "-t", String(total),
+      "-c:v", "libx264", "-profile:v", "high", "-preset", "veryfast", "-r", "30",
+      "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+      "-movflags", "+faststart", out,
+    ]);
+    return await fs.readFile(out);
+  } finally {
+    fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+
+════════════════════════════════════════════════════════════════
+### FILE: server.ts
+════════════════════════════════════════════════════════════════
+import express from "express";
+import { createServer as createViteServer } from "vite";
+import path from "path";
+import dotenv from "dotenv";
+import JSZip from "jszip";
+import sharp from "sharp";
+import { GoogleGenAI } from "@google/genai";
+
+import { SOURCES } from "./src/server/sources.js";
+import { collectAll, markUsed } from "./src/server/collect.js";
+import { pickSlideImages, downloadImage } from "./src/server/images.js";
+import { renderSlide } from "./src/server/render.js";
+import { proposeTopicsFromArticles, writeContent } from "./src/server/editor.js";
+import { translateSingleText, isMostlyKorean } from "./src/server/translate.js";
+import {
+  sendTelegramMessage,
+  sendAlbum,
+  answerCallbackQuery,
+  setupWebhook,
+  sendPhoto,
+  editPhoto,
+  sendVideo,
+  downloadTelegramFile,
+} from "./src/server/telegram.js";
+import { publishCarousel, publishReel } from "./src/server/instagram.js";
+import { makeSlideshowReel } from "./src/server/video.js";
+import type {
+  Article,
+  Job,
+  Topic,
+  ServerConfig,
+  LogEntry,
+  SlideContent,
+  Pending,
+} from "./src/server/types.js";
+
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+const PORT = Number(process.env.PORT || 3000);
+const isProd = process.env.NODE_ENV === "production";
+
+// Google GenAI 인스턴스 초기화
+const ai = new GoogleGenAI();
+
+// ── 서버 메모리 상태 ──
+
+let articlesCache: Article[] = [];
+let lastCollectedAt = 0;
+const jobs = new Map<string, Job>();
+const imageBuffers = new Map<string, Buffer>();
+const seenUpdates = new Set<number>();
+const logs: LogEntry[] = [];
+
+export const config: ServerConfig = {
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || "",
+  telegramChatId: process.env.TELEGRAM_CHAT_ID || "",
+  telegramSecret: process.env.TELEGRAM_SECRET || "subculture-mag-secret",
+  publicBaseUrl: process.env.APP_URL || `http://localhost:${PORT}`,
+  tgMode: (process.env.TG_MODE as any) || "off",
+  cronSecret: process.env.CRON_SECRET || "subcul-cron-secret",
+  handle: process.env.MAG_HANDLE || "@animemag.kr",
+  braveApiKey: process.env.BRAVE_API_KEY || "",
+  maxAgeHours: Number(process.env.MAX_AGE_HOURS || 48),
+  textModel: process.env.TEXT_MODEL || "gemini-3.1-flash-lite",
+  igUserId: process.env.IG_USER_ID || "",
+  igAccessToken: process.env.IG_ACCESS_TOKEN || "",
+};
+
+export function addLog(
+  level: "info" | "warn" | "error" | "success",
+  message: string
+) {
+  const entry: LogEntry = {
+    id: Math.random().toString(36).substring(2, 9),
+    time: new Date().toLocaleTimeString("ko-KR", { hour12: false }),
+    level,
+    message,
+  };
+  logs.unshift(entry);
+  if (logs.length > 150) logs.pop();
+  console.log(`[${entry.time}] [${level.toUpperCase()}] ${message}`);
+}
+
+const newId = () => Math.random().toString(36).substring(2, 10);
+
+// ── 핵심 파이프라인 함수 ──
+
+async function proposeTopics(hint?: string): Promise<Job> {
+  addLog("info", "토픽 제안 파이프라인 시작...");
+
+  // 기사 캐시가 비어있거나 2시간 이상 지났으면 새로 수집
+  if (!articlesCache.length || Date.now() - lastCollectedAt > 2 * 3600_000) {
+    articlesCache = await collectAll(
+      ai,
+      config.textModel,
+      config.maxAgeHours,
+      (m) => addLog("info", m)
+    );
+    lastCollectedAt = Date.now();
+  }
+
+  const job: Job = {
+    id: newId(),
+    createdAt: Date.now(),
+    status: "proposing",
+  };
+  jobs.set(job.id, job);
+
+  try {
+    const balanced = (["anime", "game", "jpop"] as const)
+      .flatMap((c) => articlesCache.filter((a) => a.cat === c).slice(0, 15));
+    const cnt = (c: string) => balanced.filter((a) => a.cat === c).length;
+    addLog(
+      cnt("jpop") ? "info" : "warn",
+      `후보 풀: 애니 ${cnt("anime")} · 게임 ${cnt("game")} · J-POP ${cnt("jpop")}`
+    );
+    const proposed = await proposeTopicsFromArticles(
+      ai,
+      config.textModel,
+      balanced,
+      hint
+    );
+    job.topics = proposed;
+    job.status = "idle";
+    addLog("success", `AI가 ${proposed.length}개의 카드뉴스 후보를 선별했습니다.`);
+
+    // 텔레그램 1차 컨펌 메시지 발송 (설정되어 있는 경우)
+    if (config.telegramBotToken && config.telegramChatId) {
+      let text = `<b>📰 [서브컬처 매거진] 오늘의 추천 뉴스 5선</b>\n\n`;
+      proposed.forEach((t, i) => {
+        text += `<b>${i + 1}. [${t.cat.toUpperCase()}] ${t.title}</b>\n`;
+        text += `💡 <i>${t.angle}</i>\n`;
+        text += `📎 출처: ${t.sourceName || "공식 채널"}\n\n`;
+      });
+      text += `제작할 기사의 번호를 선택해 주세요:`;
+
+      const keyboard = [
+        proposed.map((_, i) => ({
+          text: `${i + 1}번 제작`,
+          callback_data: `pick:${job.id}:${i}`,
+        })),
+        [
+          { text: "🎌 애니만", callback_data: `regen:${job.id}:anime` },
+          { text: "🎮 게임만", callback_data: `regen:${job.id}:game` },
+          { text: "🎵 J-POP만", callback_data: `regen:${job.id}:jpop` },
+        ],
+        [
+          { text: "🔄 후보 다시 뽑기", callback_data: `regen:${job.id}:0` },
+          { text: "❌ 취소", callback_data: `cancel:${job.id}:0` },
+        ],
+      ];
+
+      await sendTelegramMessage(
+        config.telegramBotToken,
+        config.telegramChatId,
+        text,
+        { reply_markup: { inline_keyboard: keyboard } }
+      );
+    }
+
+    return job;
+  } catch (err: any) {
+    job.status = "error";
+    job.error = err.message;
+    addLog("error", `토픽 제안 실패: ${err.message}`);
+    throw err;
+  }
+}
+
+// ── 텔레그램 편집 흐름 헬퍼 ──
+
+const esc = (s = "") =>
+  s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]!));
+const plain = (s = "") => s.replace(/<[^>]+>/g, "");
+type Btn = [string, string];
+const ik = (rows: Btn[][]) => ({
+  inline_keyboard: rows.map((r) =>
+    r.map(([text, callback_data]) => ({ text, callback_data }))
+  ),
+});
+const say = (text: string, rows?: Btn[][]) =>
+  sendTelegramMessage(
+    config.telegramBotToken,
+    config.telegramChatId,
+    text,
+    rows ? { reply_markup: ik(rows) } : {}
+  );
+const clamp = (v: number, a = 0, b = 100) => Math.max(a, Math.min(b, v));
+
+let pendingJobId: string | null = null;
+function setPending(job: Job, p: Pending) {
+  job.pending = p;
+  pendingJobId = job.id;
+}
+
+function storeMedia(buf: Buffer, ext: "jpg" | "mp4") {
+  const name = `${newId()}${newId()}.${ext}`;
+  imageBuffers.set(name, buf);
+  return name;
+}
+const mediaUrl = (name: string) =>
+  `${config.publicBaseUrl.replace(/\/+$/, "")}/media/${name}`;
+const slideBufs = (job: Job) =>
+  (job.imageFiles || []).map((f) => imageBuffers.get(f)!).filter(Boolean);
+
+async function renderOne(job: Job, i: number) {
+  const s = job.slides![i];
+  const buf = await renderSlide({
+    img: job.slideImgs?.[i] ?? null,
+    headline: s.headline,
+    body: s.body,
+    index: i,
+    total: job.slides!.length,
+    cat: job.topic!.cat,
+    source: job.topic!.sourceName,
+    handle: config.handle,
+    style: { ...(s.style || {}), aspectRatio: job.cardRatio || "4:5" },
+  });
+  job.imageFiles ??= [];
+  job.renderedSlideDataUrls ??= [];
+  const old = job.imageFiles[i];
+  if (old) imageBuffers.delete(old);
+  job.imageFiles[i] = storeMedia(buf, "jpg");
+  job.renderedSlideDataUrls[i] = `data:image/jpeg;base64,${buf.toString("base64")}`;
+  return buf;
+}
+
+async function renderAll(job: Job) {
+  (job.imageFiles || []).forEach((f) => imageBuffers.delete(f));
+  job.imageFiles = [];
+  job.renderedSlideDataUrls = [];
+  return Promise.all(job.slides!.map((_, i) => renderOne(job, i)));
+}
+
+// 슬라이드 관련 배열들을 한꺼번에 조작 (페이지 삭제/이동용)
+function slideArrays(job: Job): any[][] {
+  job.slideCandidates ??= [];
+  job.candidateCursor ??= [];
+  return [
+    job.slides!,
+    job.slideImgs!,
+    job.slideImgUrls!,
+    job.slideCandidates,
+    job.candidateCursor,
+  ];
+}
+
+async function nextImage(job: Job, i: number): Promise<boolean> {
+  const own = job.slideCandidates?.[i] || [];
+  const cands = own.length ? own : (job.slideCandidates || []).flat();
+  job.candidateCursor ??= [];
+  for (let c = job.candidateCursor[i] ?? 0; c < cands.length; c++) {
+    const u = cands[c];
+    if (!u || job.slideImgUrls?.includes(u)) continue;
+    const b = await downloadImage(u);
+    if (!b) continue;
+    job.slideImgs![i] = b;
+    job.slideImgUrls![i] = u;
+    job.candidateCursor[i] = c + 1;
+    delete job.slides![i].style;
+    return true;
+  }
+  job.candidateCursor[i] = 0;
+  return false;
+}
+
+function slideCaption(job: Job, i: number) {
+  const st = job.slides![i].style || {};
+  return (
+    `🛠 <b>${i + 1}/${job.slides!.length}페이지 편집</b>\n${esc(job.slides![i].headline)}\n\n` +
+    `크기 x${(st.imageScale ?? 1).toFixed(2)} · 위치 X${st.imageOffsetX ?? 50}/Y${st.imageOffsetY ?? 50} · ` +
+    `사진영역 ${Math.round((st.imageRatio ?? 1) * 100)}% · ${st.imageFit ?? "cover"}`
+  );
+}
+
+function slideKb(job: Job, i: number) {
+  const id = job.id;
+  return ik([
+    [
+      ["⬆️ 위쪽", `mv:${id}:${i}:u`],
+      ["⬇️ 아래쪽", `mv:${id}:${i}:d`],
+      ["⬅️", `mv:${id}:${i}:l`],
+      ["➡️", `mv:${id}:${i}:r`],
+    ],
+    [
+      ["🔍 확대", `mv:${id}:${i}:zi`],
+      ["🔎 축소", `mv:${id}:${i}:zo`],
+      ["⛶ 맞춤 전환", `mv:${id}:${i}:fit`],
+    ],
+    [
+      ["사진영역 100%", `mv:${id}:${i}:r100`],
+      ["60%", `mv:${id}:${i}:r60`],
+      ["45%", `mv:${id}:${i}:r45`],
+    ],
+    [
+      ["🔄 다음 후보 사진", `nimg:${id}:${i}`],
+      ["📤 내 사진으로 교체", `upimg:${id}:${i}`],
+    ],
+    [
+      ["✏️ 텍스트 수정", `txt:${id}:${i}`],
+      ["➕ 뒤에 페이지 추가", `add:${id}:${i}`],
+    ],
+    [
+      ["◀ 앞으로 이동", `mvp:${id}:${i}`],
+      ["🗑 삭제", `del:${id}:${i}`],
+      ["↩️ 목록", `menu:${id}`],
+    ],
+  ]);
+}
+
+function applyMove(job: Job, i: number, op: string) {
+  const st = (job.slides![i].style ??= {});
+  const step = 12;
+  if (op === "u") st.imageOffsetY = clamp((st.imageOffsetY ?? 50) - step);
+  if (op === "d") st.imageOffsetY = clamp((st.imageOffsetY ?? 50) + step);
+  if (op === "l") st.imageOffsetX = clamp((st.imageOffsetX ?? 50) - step);
+  if (op === "r") st.imageOffsetX = clamp((st.imageOffsetX ?? 50) + step);
+  if (op === "zi") st.imageScale = Math.min(2.5, (st.imageScale ?? 1) + 0.15);
+  if (op === "zo") st.imageScale = Math.max(1, (st.imageScale ?? 1) - 0.15);
+  if (op === "fit") st.imageFit = st.imageFit === "contain" ? "cover" : "contain";
+  if (op === "r100") st.imageRatio = 1;
+  if (op === "r60") st.imageRatio = 0.6;
+  if (op === "r45") st.imageRatio = 0.45;
+}
+
+async function sendSlideEditor(job: Job, i: number) {
+  const buf = imageBuffers.get(job.imageFiles![i]) || (await renderOne(job, i));
+  await sendPhoto(
+    config.telegramBotToken,
+    config.telegramChatId,
+    buf,
+    slideCaption(job, i),
+    slideKb(job, i)
+  );
+}
+
+// 2단계: 컨펌·편집 메뉴
+async function sendEditMenu(job: Job, withAlbum = true) {
+  const id = job.id,
+    n = job.slides!.length;
+  if (withAlbum) {
+    await sendAlbum(
+      config.telegramBotToken,
+      config.telegramChatId,
+      slideBufs(job),
+      `📰 ${plain(job.topic!.title)} 미리보기 (${n}장)`
+    );
+  }
+  const pages: Btn[] = job.slides!.map((_, i) => [`${i + 1}p 편집`, `sl:${id}:${i}`]);
+  const rows: Btn[][] = [];
+  for (let k = 0; k < pages.length; k += 4) rows.push(pages.slice(k, k + 4));
+  rows.push([
+    ["➕ 맨 뒤에 페이지 추가", `add:${id}:${n - 1}`],
+    [`📐 비율 ${job.cardRatio || "4:5"} → 전환`, `ratio:${id}`],
+  ]);
+  rows.push([
+    ["✏️ 캡션 수정", `cap:${id}`],
+    ["🖼 사진 전체 다시", `reimg:${id}`],
+    ["📝 원고 재작성", `rewrite:${id}`],
+  ]);
+  rows.push([["✅ 컨펌 완료 → 음악 선택", `next:${id}`]]);
+  rows.push([["❌ 작업 취소", `cancel:${id}`]]);
+  await say(
+    `🧾 <b>2단계: 카드뉴스 컨펌</b>\n수정할 페이지를 누르세요.\n\n<b>캡션 미리보기</b>\n${esc(
+      plain(job.caption || "")
+    ).slice(0, 700)}`,
+    rows
+  );
+}
+
+async function publishJob(job: Job, mode: "c" | "r") {
+  if (!config.igUserId || !config.igAccessToken) {
+    await say("⚠️ IG_USER_ID / IG_ACCESS_TOKEN 환경변수를 먼저 설정해 주세요.");
+    return;
+  }
+  if (/localhost|aistudio\.google\.com/.test(config.publicBaseUrl)) {
+    await say(
+      "⚠️ APP_URL 이 공개 주소가 아닙니다. 인스타 서버가 이미지를 가져갈 수 있는 배포(Cloud Run) 주소가 필요합니다."
+    );
+    return;
+  }
+  job.status = "generating";
+  await say("📤 인스타그램 업로드 중... (1~3분)");
+  try {
+    const caption = plain(job.caption || "").slice(0, 2200);
+    const r =
+      mode === "r"
+        ? await publishReel({
+            igUserId: config.igUserId,
+            token: config.igAccessToken,
+            videoUrl: mediaUrl(job.videoFile!),
+            caption,
+            audioName: job.music?.name,
+          })
+        : await publishCarousel({
+            igUserId: config.igUserId,
+            token: config.igAccessToken,
+            imageUrls: job.imageFiles!.slice(0, 10).map(mediaUrl),
+            caption,
+          });
+    job.status = "published";
+    if (job.topic?.sourceUrl) markUsed(job.topic.sourceUrl);
+    addLog("success", `인스타 업로드 완료: ${r.permalink || r.id}`);
+    await say(`🎉 <b>업로드 완료!</b>\n${r.permalink || r.id}`);
+  } catch (e: any) {
+    job.status = "review";
+    addLog("error", `인스타 업로드 실패: ${e.message}`);
+    await say(`❌ 업로드 실패: ${esc(e.message)}`, [
+      [
+        ["🔁 다시 시도", `go:${job.id}:${mode}`],
+        ["↩️ 편집으로", `menu:${job.id}`],
+      ],
+    ]);
+  }
+}
+
+async function buildAndPreview(
+  job: Job,
+  opts: { rewrite?: boolean; newImages?: boolean } = { rewrite: true, newImages: true }
+): Promise<Job> {
+  if (!job.topic) throw new Error("Job topic is missing");
+  job.status = "generating";
+  addLog("info", `🎨 "${job.topic.title}" 카드뉴스 제작을 시작합니다...`);
+
+  try {
+    // 1. 원고 작성
+    if (opts.rewrite || !job.slides) {
+      addLog("info", "📝 Gemini로 4~5장 슬라이드 원고 및 인스타 캡션 작성 중...");
+      const written = await writeContent(
+        ai,
+        config.textModel,
+        job.topic,
+        config.handle
+      );
+      job.slides = written.slides;
+      job.caption = written.caption;
+      addLog("success", `원고 작성 완료 (슬라이드 ${job.slides.length}장)`);
+    }
+
+    // 2. 이미지 검색 & dhash 중복 방지
+    if (opts.newImages || !job.slideImgs) {
+      const { bufs, urls, cands } = await pickSlideImages(
+        job.topic,
+        job.slides as { imageQuery: string }[],
+        job.usedImageUrls || [],
+        config.braveApiKey,
+        (m) => addLog("info", m)
+      );
+      job.slideImgs = bufs;
+      job.slideImgUrls = urls;
+      job.slideCandidates = cands;
+      job.candidateCursor = [];
+      job.usedImageUrls = [...(job.usedImageUrls || []), ...urls.filter(Boolean)];
+      job.slides!.forEach((s) => delete s.style);
+    }
+
+    await renderAll(job);
+    job.status = "review";
+    addLog("success", `🎉 ${job.slides!.length}장 렌더링 완료`);
+    if (config.telegramBotToken && config.telegramChatId) await sendEditMenu(job);
+    return job;
+  } catch (err: any) {
+    job.status = "error";
+    job.error = err.message;
+    addLog("error", `카드뉴스 제작 에러: ${err.message}`);
+    throw err;
+  }
+}
+
+// ── 텔레그램 웹훅 및 명령 처리 ──
+
+async function handleTelegramUpdate(u: any) {
+  const from = u.message?.from?.id ?? u.callback_query?.from?.id;
+  if (!from) return;
+  if (config.telegramChatId && String(from) !== String(config.telegramChatId)) {
+    addLog("warn", `미인가 텔레그램 사용자 차단: ${from}`);
+    return;
+  }
+
+  // ── 일반 메시지 (명령어 / 사진·텍스트·음악 입력) ──
+  const msg = u.message;
+  if (msg) {
+    const text = (msg.text || msg.caption || "").trim();
+    if (/^\/(news|start)/.test(text)) {
+      await say("🔍 최신 서브컬처 기사를 수집해서 후보를 추천합니다...");
+      await proposeTopics(text.replace(/^\/(news|start)/, "").trim() || undefined);
+      return;
+    }
+    const job = pendingJobId ? jobs.get(pendingJobId) : undefined;
+    if (text === "/cancel" && job) {
+      job.pending = undefined;
+      await say("입력을 취소했습니다.");
+      await sendEditMenu(job, false);
+      return;
+    }
+    if (job?.pending) await handlePending(job, msg, text);
+    return;
+  }
+
+  // ── 버튼 클릭 ──
+  const cq = u.callback_query;
+  if (!cq) return;
+  await answerCallbackQuery(config.telegramBotToken, cq.id, "처리 중...");
+  const [act, id, a1, a2] = (cq.data || "").split(":");
+  const job = jobs.get(id);
+  const msgId: number | undefined = cq.message?.message_id;
+  if (!job) {
+    await say("⚠️ 만료된 작업입니다. /news 로 새로 시작해 주세요.");
+    return;
+  }
+  if (job.status === "generating") {
+    await say("⏳ 작업이 진행 중입니다. 잠시만 기다려 주세요!");
+    return;
+  }
+  const i = Number(a1);
+
+  switch (act) {
+    // 1단계
+    case "pick": {
+      job.topic = job.topics?.[i];
+      if (!job.topic) {
+        await say("선택한 토픽이 없습니다.");
+        return;
+      }
+      await say(`🎨 <b>선택: ${esc(job.topic.title)}</b>\n카드뉴스 제작을 시작합니다.`);
+      await buildAndPreview(job);
+      break;
+    }
+    case "regen": {
+      const hints: Record<string, string> = {
+        anime: "애니메이션 소식만",
+        game: "서브컬처 게임 소식만",
+        jpop: "J-POP·애니송 소식만",
+      };
+      await proposeTopics(hints[a1]);
+      break;
+    }
+
+    // 2단계: 편집
+    case "menu":
+      job.pending = undefined;
+      await sendEditMenu(job, true);
+      break;
+    case "sl":
+      await sendSlideEditor(job, i);
+      break;
+    case "mv": {
+      applyMove(job, i, a2);
+      const buf = await renderOne(job, i);
+      if (msgId)
+        await editPhoto(
+          config.telegramBotToken,
+          config.telegramChatId,
+          msgId,
+          buf,
+          slideCaption(job, i),
+          slideKb(job, i)
+        );
+      break;
+    }
+    case "nimg": {
+      if (!(await nextImage(job, i))) {
+        await say("더 이상 후보 사진이 없습니다. 📤 <b>내 사진으로 교체</b>를 이용해 주세요.");
+        return;
+      }
+      const buf = await renderOne(job, i);
+      if (msgId)
+        await editPhoto(
+          config.telegramBotToken,
+          config.telegramChatId,
+          msgId,
+          buf,
+          slideCaption(job, i),
+          slideKb(job, i)
+        );
+      break;
+    }
+    case "upimg":
+      setPending(job, { kind: "photo", slideIdx: i });
+      await say(`📤 ${i + 1}페이지에 넣을 <b>사진</b>(또는 이미지 URL)을 보내 주세요. 취소: /cancel`);
+      break;
+    case "txt": {
+      const s = job.slides![i];
+      setPending(job, { kind: "editText", slideIdx: i });
+      await say(
+        `✏️ 현재 내용:\n<code>${esc(s.headline)}\n${esc(s.body)}</code>\n\n첫 줄은 제목, 둘째 줄부터는 본문으로 보내 주세요.`
+      );
+      break;
+    }
+    case "add":
+      setPending(job, { kind: "addPage", afterIdx: i });
+      await say(
+        `➕ ${i + 2}페이지로 들어갈 내용을 보내 주세요.\n첫 줄은 제목, 다음 줄부터 본문입니다.\n사진에 캡션으로 적어 보내면 그 사진이 사용됩니다.`
+      );
+      break;
+    case "del": {
+      if (job.slides!.length <= 2) {
+        await say("최소 2장은 있어야 합니다.");
+        return;
+      }
+      slideArrays(job).forEach((arr) => arr.splice(i, 1));
+      await renderAll(job);
+      await say(`🗑 ${i + 1}페이지를 삭제했습니다.`);
+      await sendEditMenu(job);
+      break;
+    }
+    case "mvp": {
+      if (i <= 0) return;
+      slideArrays(job).forEach((arr) => {
+        [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+      });
+      await renderAll(job);
+      await sendEditMenu(job);
+      break;
+    }
+    case "ratio":
+      // 인스타 캐러셀은 첫 장 비율로 전체가 잘리므로 전체 통일 (피드는 4:5 / 1:1 권장)
+      job.cardRatio = job.cardRatio === "1:1" ? "4:5" : "1:1";
+      await renderAll(job);
+      await sendEditMenu(job);
+      break;
+    case "cap":
+      setPending(job, { kind: "caption" });
+      await say("✏️ 새 인스타 캡션 전체를 보내 주세요. 취소: /cancel");
+      break;
+    case "reimg":
+      await say("🖼 새 사진을 찾아서 다시 만듭니다...");
+      await buildAndPreview(job, { rewrite: false, newImages: true });
+      break;
+    case "rewrite":
+      await say("✏️ 원고를 다시 작성합니다...");
+      await buildAndPreview(job, { rewrite: true, newImages: false });
+      break;
+
+    // 3단계: 음악 선택 후 업로드
+    case "next":
+      await say(
+        "🎵 <b>3단계: 음악 선택</b>\n인스타 API는 이미지 캐러셀에 음악을 붙일 수 없습니다.\n음악을 넣으면 슬라이드 영상(<b>릴스</b>)으로 만들어 올립니다.",
+        [
+          [["🎵 음악 넣기 (릴스로 게시)", `music:${id}`]],
+          [["🖼 음악 없이 캐러셀 게시", `pubc:${id}`]],
+          [["↩️ 편집으로", `menu:${id}`]],
+        ]
+      );
+      break;
+    case "music":
+      setPending(job, { kind: "music" });
+      await say(
+        "🎵 음악 파일(mp3/m4a, 20MB 이하)을 보내 주세요.\n파일 캡션에 시작 초(예: <code>45</code>)를 적으면 그 지점부터 사용합니다.\n⚠️ 상업 음원은 저작권 때문에 음소거되거나 삭제될 수 있습니다."
+      );
+      break;
+    case "pubc":
+      await say(
+        `✅ <b>최종 확인</b>\n${job.slides!.length}장 캐러셀을 인스타그램에 게시할까요?`,
+        [
+          [["🚀 업로드 확정", `go:${id}:c`]],
+          [["↩️ 편집으로", `menu:${id}`]],
+        ]
+      );
+      break;
+    case "go":
+      await publishJob(job, a1 === "r" ? "r" : "c");
+      break;
+    case "cancel":
+      job.status = "canceled";
+      job.pending = undefined;
+      await say("❌ 작업을 취소했습니다.");
+      break;
+  }
+}
+
+async function handlePending(job: Job, msg: any, text: string) {
+  const token = config.telegramBotToken;
+  const p = job.pending!;
+  const photoId =
+    msg.photo?.at(-1)?.file_id ||
+    (msg.document?.mime_type?.startsWith("image/") ? msg.document.file_id : undefined);
+  const audioId =
+    msg.audio?.file_id ||
+    msg.voice?.file_id ||
+    (msg.document?.mime_type?.startsWith("audio/") ? msg.document.file_id : undefined);
+  const split = (t: string) => {
+    const [h, ...rest] = t.split("\n");
+    return { headline: h.trim(), body: rest.join(" ").trim() };
+  };
+  const loadPhoto = async () => {
+    const raw = photoId
+      ? await downloadTelegramFile(token, photoId)
+      : /^https?:\/\//.test(text)
+      ? await downloadImage(text)
+      : null;
+    return raw ? await sharp(raw).rotate().jpeg({ quality: 92 }).toBuffer() : null; // 폰 사진 회전 정보 보정
+  };
+
+  switch (p.kind) {
+    case "photo": {
+      const buf = await loadPhoto();
+      if (!buf) {
+        await say("사진이나 이미지 URL을 보내 주세요. 취소: /cancel");
+        return;
+      }
+      job.slideImgs![p.slideIdx] = buf;
+      job.slideImgUrls![p.slideIdx] = "user-upload";
+      delete job.slides![p.slideIdx].style;
+      job.pending = undefined;
+      await renderOne(job, p.slideIdx);
+      await sendSlideEditor(job, p.slideIdx);
+      return;
+    }
+    case "editText": {
+      if (!text) {
+        await say("텍스트로 보내 주세요.");
+        return;
+      }
+      const { headline, body } = split(text);
+      job.slides![p.slideIdx].headline = headline;
+      if (body) job.slides![p.slideIdx].body = body;
+      job.pending = undefined;
+      await renderOne(job, p.slideIdx);
+      await sendSlideEditor(job, p.slideIdx);
+      return;
+    }
+    case "addPage": {
+      if (!text) {
+        await say("첫 줄 제목, 다음 줄 본문으로 보내 주세요. (사진 캡션도 가능)");
+        return;
+      }
+      const { headline, body } = split(text);
+      const at = p.afterIdx + 1;
+      const img = await loadPhoto();
+      slideArrays(job); // 배열 초기화
+      job.slides!.splice(at, 0, { headline, body, imageQuery: "" });
+      job.slideImgs!.splice(at, 0, img);
+      job.slideImgUrls!.splice(at, 0, img ? "user-upload" : "");
+      job.slideCandidates!.splice(at, 0, []);
+      job.candidateCursor!.splice(at, 0, 0);
+      if (!img) await nextImage(job, at);
+      job.pending = undefined;
+      await renderAll(job);
+      await say(`➕ ${at + 1}페이지를 추가했습니다.`);
+      await sendEditMenu(job);
+      return;
+    }
+    case "caption": {
+      if (!text) {
+        await say("캡션을 텍스트로 보내 주세요.");
+        return;
+      }
+      job.caption = text;
+      job.pending = undefined;
+      await say("✅ 캡션을 수정했습니다.");
+      await sendEditMenu(job, false);
+      return;
+    }
+    case "music": {
+      if (!audioId) {
+        await say("🎵 음악 파일을 보내 주세요. 취소: /cancel");
+        return;
+      }
+      const size =
+        msg.audio?.file_size || msg.voice?.file_size || msg.document?.file_size || 0;
+      if (size > 20 * 1024 * 1024) {
+        await say("20MB 이하 파일만 받을 수 있습니다.");
+        return;
+      }
+      const start = Number((msg.caption || "").match(/\d+(\.\d+)?/)?.[0] || 0);
+      const name = msg.audio
+        ? [msg.audio.performer, msg.audio.title].filter(Boolean).join(" - ") || "BGM"
+        : msg.document?.file_name || "BGM";
+      job.pending = undefined;
+      job.status = "generating";
+      try {
+        await say("🎬 슬라이드와 음악으로 릴스 영상을 만드는 중...");
+        const audio = await downloadTelegramFile(token, audioId);
+        const video = await makeSlideshowReel(slideBufs(job), audio, { audioStart: start });
+        if (job.videoFile) imageBuffers.delete(job.videoFile);
+        job.videoFile = storeMedia(video, "mp4");
+        job.music = { name, start };
+        await sendVideo(
+          token,
+          config.telegramChatId,
+          video,
+          `🎬 릴스 미리보기\n🎵 ${esc(name)} (${start}초부터)`,
+          ik([
+            [["🚀 인스타 릴스 업로드", `go:${job.id}:r`]],
+            [
+              ["🔁 다른 음악", `music:${job.id}`],
+              ["↩️ 편집으로", `menu:${job.id}`],
+            ],
+          ])
+        );
+      } catch (e: any) {
+        await say(`❌ 영상 제작 실패: ${esc(e.message).slice(0, 500)}`);
+      } finally {
+        job.status = "review";
+      }
+      return;
+    }
+  }
+}
+
+// ── REST API 라우트 ──
+
+app.get("/api/config", (_req, res) => {
+  res.json({
+    ...config,
+    telegramBotTokenMasked: config.telegramBotToken
+      ? `${config.telegramBotToken.slice(0, 6)}...${config.telegramBotToken.slice(-4)}`
+      : "",
+    hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+    hasBraveKey: Boolean(config.braveApiKey),
+  });
+});
+
+app.post("/api/telegram/test-connection", async (req, res) => {
+  const token = req.body.telegramBotToken || config.telegramBotToken;
+  const chatId = req.body.telegramChatId || config.telegramChatId;
+
+  if (!token || !chatId) {
+    return res.status(400).json({
+      ok: false,
+      error: "텔레그램 봇 토큰(API 키)과 Chat ID를 모두 입력해 주세요.",
+    });
+  }
+
+  try {
+    const text = `🎉 <b>[서브컬처 매거진 봇] 연동 테스트 성공!</b>\n\n봇 API 키와 Chat ID가 정상적으로 연결되었습니다.\n이제부터 최신 애니·게임·J-POP 카드뉴스와 추천 토픽을 텔레그램에서 바로 확인하실 수 있습니다. ✨\n\n⏱ 테스트 시각: ${new Date().toLocaleTimeString("ko-KR")}`;
+    const result = await sendTelegramMessage(token, chatId, text);
+
+    if (result?.ok) {
+      config.telegramBotToken = token;
+      config.telegramChatId = chatId;
+      addLog("success", `텔레그램 테스트 메시지 전송 성공 (Chat ID: ${chatId})`);
+      return res.json({ ok: true });
+    } else {
+      addLog("error", `텔레그램 전송 실패: ${result?.description || JSON.stringify(result)}`);
+      return res.status(400).json({
+        ok: false,
+        error: result?.description || "텔레그램 봇 응답 오류. 토큰과 Chat ID를 다시 확인해 주세요.",
+      });
+    }
+  } catch (err: any) {
+    addLog("error", `텔레그램 연동 오류: ${err.message}`);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/config", (req, res) => {
+  const {
+    telegramBotToken,
+    telegramChatId,
+    telegramSecret,
+    publicBaseUrl,
+    handle,
+    braveApiKey,
+    maxAgeHours,
+    textModel,
+  } = req.body;
+
+  if (telegramBotToken !== undefined) config.telegramBotToken = telegramBotToken;
+  if (telegramChatId !== undefined) config.telegramChatId = telegramChatId;
+  if (telegramSecret !== undefined) config.telegramSecret = telegramSecret;
+  if (publicBaseUrl !== undefined) config.publicBaseUrl = publicBaseUrl;
+  if (handle !== undefined) config.handle = handle;
+  if (braveApiKey !== undefined) config.braveApiKey = braveApiKey;
+  if (maxAgeHours !== undefined) config.maxAgeHours = Number(maxAgeHours);
+  if (textModel !== undefined) config.textModel = textModel;
+
+  addLog("info", "서버 설정이 업데이트되었습니다.");
+  res.json({ ok: true, config });
+});
+
+app.get("/api/sources", (_req, res) => {
+  res.json({
+    sources: SOURCES,
+    total: SOURCES.length,
+    cachedArticlesCount: articlesCache.length,
+    lastCollectedAt,
+  });
+});
+
+app.post("/api/collect", async (_req, res) => {
+  try {
+    articlesCache = await collectAll(
+      ai,
+      config.textModel,
+      config.maxAgeHours,
+      (m) => addLog("info", m)
+    );
+    lastCollectedAt = Date.now();
+    res.json({
+      ok: true,
+      count: articlesCache.length,
+      articles: articlesCache,
+    });
+  } catch (err: any) {
+    addLog("error", `수집 실패: ${err.message}`);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/articles", (req, res) => {
+  const cat = req.query.cat as string;
+  let list = articlesCache;
+  if (cat && ["anime", "game", "jpop"].includes(cat)) {
+    list = list.filter((a) => a.cat === cat);
+  }
+  res.json({
+    articles: list,
+    lastCollectedAt,
+    total: articlesCache.length,
+  });
+});
+
+app.post("/api/propose", async (req, res) => {
+  const { hint } = req.body;
+  try {
+    const job = await proposeTopics(hint);
+    res.json({ ok: true, job });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/translate-article", async (req, res) => {
+  const { link, title, snippet } = req.body;
+  if (!title) return res.status(400).json({ ok: false, error: "Title is required" });
+
+  try {
+    const titleKo = await translateSingleText(ai, title, "title");
+    let snippetKo = snippet;
+    if (snippet && !isMostlyKorean(snippet)) {
+      snippetKo = await translateSingleText(ai, snippet, "body");
+    }
+
+    if (link) {
+      const art = articlesCache.find((a) => a.link === link);
+      if (art) {
+        art.titleKo = titleKo;
+        art.snippetKo = snippetKo;
+      }
+    }
+
+    res.json({ ok: true, titleKo, snippetKo });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/generate", async (req, res) => {
+  const { topic, custom } = req.body;
+  try {
+    let targetTopic: Topic;
+
+    if (custom) {
+      targetTopic = {
+        idx: -1,
+        title: custom.title || "서브컬처 특별 기획",
+        angle: custom.angle || "긴급 속보 및 주요 내용 정리",
+        why: "사용자 직접 기획 제작",
+        cat: custom.cat || "anime",
+        entity: custom.entity || custom.title || "Anime",
+        sourceName: custom.sourceName || "공식 발표",
+        sourceUrl: custom.sourceUrl || "",
+        articleImages: custom.imageUrl ? [custom.imageUrl] : [],
+      };
+    } else if (topic) {
+      targetTopic = topic;
+    } else {
+      return res.status(400).json({ ok: false, error: "topic 또는 custom 입력이 필요합니다." });
+    }
+
+    // 🛡️ 카드뉴스 제작 전 토픽 제목/앵글 100% 한국어 검증
+    if (!isMostlyKorean(targetTopic.title)) {
+      targetTopic.title = await translateSingleText(ai, targetTopic.title, "title");
+    }
+    if (targetTopic.angle && !isMostlyKorean(targetTopic.angle)) {
+      targetTopic.angle = await translateSingleText(ai, targetTopic.angle, "body");
+    }
+
+    const job: Job = {
+      id: newId(),
+      createdAt: Date.now(),
+      status: "generating",
+      topic: targetTopic,
+    };
+    jobs.set(job.id, job);
+
+    // 백그라운드 대신 결과를 대기하여 브라우저에 반환
+    const completedJob = await buildAndPreview(job);
+    res.json({ ok: true, job: completedJob });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/jobs", (_req, res) => {
+  const list = [...jobs.values()]
+    .map((j) => ({
+      id: j.id,
+      createdAt: j.createdAt,
+      status: j.status,
+      title: j.topic?.title || "미정",
+      cat: j.topic?.cat || "anime",
+      slideCount: j.slides?.length || 0,
+      hasImages: Boolean(j.renderedSlideDataUrls?.length),
+    }))
+    .sort((a, b) => b.createdAt - a.createdAt);
+  res.json({ jobs: list });
+});
+
+app.get("/api/jobs/:id", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+  res.json({ ok: true, job });
+});
+
+app.get("/api/jobs/:id/slides/:index.jpg", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || !job.imageFiles) return res.status(404).send("Not found");
+  const idx = Number(req.params.index);
+  const fileName = job.imageFiles[idx];
+  if (!fileName || !imageBuffers.has(fileName)) return res.status(404).send("Slide not found");
+
+  const buf = imageBuffers.get(fileName)!;
+  res.setHeader("Content-Type", "image/jpeg");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(buf);
+});
+
+app.get("/api/jobs/:id/download-zip", async (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || !job.imageFiles?.length) return res.status(404).send("Job images not found");
+
+  try {
+    const zip = new JSZip();
+    job.imageFiles.forEach((f, i) => {
+      const b = imageBuffers.get(f);
+      if (b) {
+        zip.file(`slide_${String(i + 1).padStart(2, "0")}.jpg`, b);
+      }
+    });
+
+    if (job.caption) {
+      zip.file("instagram_caption.txt", job.caption);
+    }
+
+    const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+    const cleanTitle = (job.topic?.title || "magazine")
+      .replace(/[^\w\s\uAC00-\uD7A3-]/g, "")
+      .trim()
+      .slice(0, 30);
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${encodeURIComponent(cleanTitle || "magazine")}_cards.zip"`
+    );
+    res.send(zipBuffer);
+  } catch (err: any) {
+    res.status(500).send("Zip generation error");
+  }
+});
+
+app.post("/api/jobs/:id/regenerate-images", async (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+  try {
+    const updated = await buildAndPreview(job, { rewrite: false, newImages: true });
+    res.json({ ok: true, job: updated });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/jobs/:id/rewrite", async (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+  try {
+    const updated = await buildAndPreview(job, { rewrite: true, newImages: false });
+    res.json({ ok: true, job: updated });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/jobs/:id/update-slide", async (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || !job.slides) return res.status(404).json({ ok: false, error: "Job not found" });
+  const { index, headline, body } = req.body;
+  if (index === undefined || !job.slides[index]) {
+    return res.status(400).json({ ok: false, error: "Invalid slide index" });
+  }
+
+  job.slides[index].headline = headline ?? job.slides[index].headline;
+  job.slides[index].body = body ?? job.slides[index].body;
+
+  // 해당 슬라이드 재렌더링
+  try {
+    const newBuf = await renderSlide({
+      img: job.slideImgs?.[index] ?? null,
+      headline: job.slides[index].headline,
+      body: job.slides[index].body,
+      index,
+      total: job.slides.length,
+      cat: job.topic!.cat,
+      source: job.topic!.sourceName,
+      handle: config.handle,
+    });
+
+    const fileName = `${job.id}-${index}-${Date.now()}.jpg`;
+    imageBuffers.set(fileName, newBuf);
+    job.imageFiles![index] = fileName;
+    job.renderedSlideDataUrls![index] = `data:image/jpeg;base64,${newBuf.toString("base64")}`;
+
+    addLog("info", `슬라이드 #${index + 1} 텍스트 수정 및 재렌더링 완료`);
+    res.json({ ok: true, job });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post("/api/jobs/:id/send-telegram", async (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ ok: false, error: "Job not found" });
+  if (!config.telegramBotToken || !config.telegramChatId) {
+    return res.status(400).json({ ok: false, error: "Telegram bot token or Chat ID is missing" });
+  }
+
+  try {
+    const buffers = (job.imageFiles || [])
+      .map((f) => imageBuffers.get(f))
+      .filter(Boolean) as Buffer[];
+
+    if (!buffers.length) {
+      return res.status(400).json({ ok: false, error: "렌더링된 슬라이드 이미지가 없습니다." });
+    }
+
+    await sendAlbum(
+      config.telegramBotToken,
+      config.telegramChatId,
+      buffers,
+      `📰 <b>${job.topic?.title || "서브컬처 매거진"}</b>\n\n${job.caption?.slice(0, 900)}`
+    );
+
+    addLog("success", `텔레그램으로 카드뉴스 앨범 전송 완료`);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/logs", (_req, res) => {
+  res.json({ logs });
+});
+
+// 인스타가 이미지와 영상을 가져갈 공개 경로
+app.get("/media/:name", (req, res) => {
+  const b = imageBuffers.get(req.params.name);
+  if (!b) return res.sendStatus(404);
+  res.type(req.params.name.endsWith(".mp4") ? "video/mp4" : "image/jpeg");
+  res.setHeader("Content-Length", String(b.length));
+  res.send(b);
+});
+
+// ── 텔레그램 공식 웹훅 라우트 ──
+
+app.post("/tg/webhook", async (req, res) => {
+  if (
+    config.telegramSecret &&
+    req.get("X-Telegram-Bot-Api-Secret-Token") !== config.telegramSecret
+  ) {
+    return res.sendStatus(401);
+  }
+
+  const id = req.body?.update_id;
+  if (id && seenUpdates.has(id)) {
+    return res.sendStatus(200);
+  }
+  if (id) seenUpdates.add(id);
+
+  handleTelegramUpdate(req.body).catch((e) => addLog("error", `Webhook error: ${e.message}`));
+  res.sendStatus(200);
+});
+
+app.get("/tg/setup", async (_req, res) => {
+  if (!config.telegramBotToken) {
+    return res.status(400).json({ ok: false, error: "텔레그램 봇 토큰이 설정되지 않았습니다." });
+  }
+  const result = await setupWebhook(
+    config.telegramBotToken,
+    config.publicBaseUrl,
+    config.telegramSecret
+  );
+  addLog("info", `텔레그램 웹훅 등록 시도: ${JSON.stringify(result)}`);
+  res.json(result);
+});
+
+// ── Cloud Scheduler Cron 라우트 ──
+
+app.get("/cron", async (req, res) => {
+  if (req.query.key !== config.cronSecret) {
+    return res.status(401).json({ error: "Unauthorized cron trigger" });
+  }
+  addLog("info", "⏰ Cloud Scheduler 크론 트리거 실행");
+  try {
+    await proposeTopics();
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Vite 미들웨어 및 서버 시작 ──
+
+async function startServer() {
+  if (!isProd) {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.resolve("dist")));
+    app.get("*", (_req, res) => {
+      res.sendFile(path.resolve("dist/index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    addLog("success", `서브컬처 매거진 봇 서버가 포트 ${PORT}에서 준비되었습니다.`);
+    console.log(`🚀 Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error("Failed to start server:", err);
+});
+
+
+════════════════════════════════════════════════════════════════
+### FILE: package.json
+════════════════════════════════════════════════════════════════
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "start": "tsx server.ts",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist server.js",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "@resvg/resvg-js": "^2.6.2",
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.1.1",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "ffmpeg-static": "^5.2.0",
+    "jszip": "^3.10.2",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "rss-parser": "^3.13.0",
+    "sharp": "^0.35.4",
+    "vite": "^8.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jszip": "^3.4.1",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2"
+  }
+}
+
+
+════════════════════════════════════════════════════════════════
+### FILE: .env.example
+════════════════════════════════════════════════════════════════
+# GEMINI_API_KEY: Required for Gemini AI API calls.
+# AI Studio automatically injects this at runtime from user secrets.
+# Users configure this via the Secrets panel in the AI Studio UI.
+GEMINI_API_KEY="MY_GEMINI_API_KEY"
+
+# APP_URL: The URL where this applet is hosted.
+# AI Studio automatically injects this at runtime with the Cloud Run service URL.
+# Used for self-referential links, OAuth callbacks, and API endpoints.
+APP_URL="MY_APP_URL"
+
+# ── 텔레그램 봇 (승인 워크플로) ──
+# 텔레그램 봇 토큰(API 키)과 승인받는 Chat ID. 설정 시 1·2·3단계 컨펌 흐름이 활성화됩니다.
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+TELEGRAM_SECRET="subculture-mag-secret"
+# TG_MODE: off | webhook | polling
+TG_MODE="off"
+
+# ── Cloud Scheduler Cron ──
+CRON_SECRET="subcul-cron-secret"
+
+# ── 매거진 설정 ──
+MAG_HANDLE="@animemag.kr"
+MAX_AGE_HOURS="48"
+TEXT_MODEL="gemini-3.1-flash-lite"
+# BRAVE_API_KEY: 선택이지만, 본문 사진의 다양성이 크게 좋아집니다.
+BRAVE_API_KEY=""
+
+# ── 인스타그램 자동 업로드 (Instagram Graph API) ──
+# 인스타 프로페셔널(비즈니스) 계정 + instagram_business_content_publish 권한이 있는 토큰 필요
+IG_USER_ID=""
+IG_ACCESS_TOKEN=""
+
+

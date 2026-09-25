@@ -1,7 +1,7 @@
 export type Cat = "anime" | "game" | "jpop";
 
 export type Source =
-  | { kind: "rss"; name: string; url: string; cat: Cat }
+  | { kind: "rss"; name: string; url: string; cat: Cat; filter?: string }
   | { kind: "reddit"; name: string; sub: string; cat: Cat };
 
 export type Article = {
@@ -37,10 +37,18 @@ export type SlideStyle = {
   imageFit?: "cover" | "contain"; // 기본 "cover"
   imageScale?: number; // 1.0 ~ 2.0 확대 (기본 1.0)
   imagePosition?: "attention" | "top" | "center" | "bottom";
+  imageOffsetX?: number; // 0 ~ 100% (기본 50)
   imageOffsetY?: number; // 0 ~ 100% (기본 50)
   overlayOpacity?: number; // 0.0 ~ 1.0 어두움 오버레이 (기본 0.85)
   customImageUrl?: string;
 };
+
+export type Pending =
+  | { kind: "photo"; slideIdx: number }
+  | { kind: "editText"; slideIdx: number }
+  | { kind: "addPage"; afterIdx: number }
+  | { kind: "caption" }
+  | { kind: "music" };
 
 export type SlideContent = {
   headline: string;
@@ -76,6 +84,11 @@ export type Job = {
   imageFiles?: string[];
   renderedSlideDataUrls?: string[];
   usedImageUrls?: string[];
+  slideCandidates?: string[][];
+  candidateCursor?: number[];
+  pending?: Pending;
+  music?: { name: string; start: number };
+  videoFile?: string;
   error?: string;
 };
 
@@ -90,6 +103,8 @@ export type ServerConfig = {
   braveApiKey: string;
   maxAgeHours: number;
   textModel: string;
+  igUserId: string;
+  igAccessToken: string;
 };
 
 export type LogEntry = {
