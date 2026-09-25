@@ -18,23 +18,56 @@ const getJson = async (u: string, h: Record<string, string> = {}) => {
 
 // ── 소스별 이미지 후보 수집 ──
 
+const BLOCK_HOSTS = [
+  "google.com",
+  "gstatic.com",
+  "googleusercontent.com",
+  "googleapis.com",
+  "vertexaisearch.cloud.google.com",
+  "x.com",
+  "twitter.com",
+  "abs.twimg.com",
+  "redditstatic.com",
+  "facebook.com",
+];
+
+export function isBlockedImageUrl(u: string): boolean {
+  try {
+    const url = new URL(u);
+    const h = url.hostname;
+    if (BLOCK_HOSTS.some((b) => h === b || h.endsWith("." + b))) return true;
+    return /logo|favicon|icon|avatar|sprite|placeholder|noimage|no_image|default[-_]?(og|share|image)|\.svg(\?|$)|\.gif(\?|$)/i.test(
+      url.pathname
+    );
+  } catch {
+    return true;
+  }
+}
+
+const isBlockedPage = (u: string) =>
+  /(^|\.)(google\.com|x\.com|twitter\.com)$/i.test(new URL(u).hostname);
+
 async function articleImages(link?: string): Promise<string[]> {
   if (!link) return [];
   try {
+    if (isBlockedPage(link) && !/vertexaisearch/.test(link)) return [];
     const res = await fetch(link, {
       headers: { "User-Agent": UA },
+      redirect: "follow",
       signal: AbortSignal.timeout(6000),
     });
-    if (!res.ok) return [];
+    // 리다이렉트 후에도 구글/X 페이지면 og:image 가 로고이므로 쓰지 않음
+    if (!res.ok || isBlockedPage(res.url)) return [];
     const html = await res.text();
     const og = [
       ...html.matchAll(
         /<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]+content=["']([^"']+)/gi
       ),
     ].map((m) => m[1]);
-
     const body = html.match(/<article[\s\S]*?<\/article>/i)?.[0] ?? html;
-    return [...og, ...extractImgs(body, link)].slice(0, 15);
+    return [...og, ...extractImgs(body, res.url)]
+      .filter((u) => !isBlockedImageUrl(u))
+      .slice(0, 15);
   } catch {
     return [];
   }
@@ -121,19 +154,23 @@ export async function downloadImage(url: string): Promise<Buffer | null> {
   if (downloadCache.has(url)) return downloadCache.get(url)!;
   let out: Buffer | null = null;
   try {
-    const origin = new URL(url).origin;
-    const r = await fetch(url, {
-      headers: { "User-Agent": UA, Referer: origin },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (r.ok) {
+    if (!isBlockedImageUrl(url)) {
+      const r = await fetch(url, {
+        headers: { "User-Agent": UA, Referer: new URL(url).origin },
+        signal: AbortSignal.timeout(8000),
+      });
       const cType = r.headers.get("content-type") || "";
-      if (cType.startsWith("image/") || url.match(/\.(jpg|jpeg|png|webp)/i)) {
+      if (r.ok && (cType.startsWith("image/") || /\.(jpe?g|png|webp)/i.test(url))) {
         const b = Buffer.from(await r.arrayBuffer());
         const m = await sharp(b).metadata();
-        // 썸네일/아이콘 제외: 최소 300x200 이상 허용 (고해상도 우선)
-        if ((m.width ?? 0) >= 300 && (m.height ?? 0) >= 200) {
-          out = b;
+        const w = m.width ?? 0,
+          h = m.height ?? 0,
+          ar = w / (h || 1);
+        // 작은 썸네일이나 배너형(너무 가로·세로로 긴) 이미지 제외
+        if (w >= 500 && h >= 350 && ar < 2.6 && ar > 0.4) {
+          // 로고·단색 그래픽은 엔트로피가 낮음 (사진은 보통 6~7.5). 필요하면 기준값 조절
+          const { entropy } = await sharp(b).stats();
+          if (entropy >= 4.5) out = b;
         }
       }
     }
@@ -180,8 +217,8 @@ export async function pickSlideImages(
   excludeUrls: string[] = [],
   braveKey?: string,
   log?: (m: string) => void
-): Promise<{ bufs: (Buffer | null)[]; urls: string[] }> {
-  log?.(`🖼 "${topic.title}" 슬라이드별 고유 이미지 수집 중...`);
+): Promise<{ bufs: (Buffer | null)[]; urls: string[]; cands: string[][] }> {
+  log?.(`🖼 "${topic.title}" 슬라이드별 이미지 수집 중...`);
 
   const fromArticle = [
     ...(topic.articleImages ?? []),
@@ -199,24 +236,32 @@ export async function pickSlideImages(
   const usedUrl = new Set<string>(excludeUrls);
   const bufs: (Buffer | null)[] = [];
   const urls: string[] = [];
+  const cands: string[][] = [];
 
   for (let i = 0; i < slides.length; i++) {
     const isCover = i === 0;
     // 표지 = 기사 대표 이미지 + 공식 API 우선
     // 본문 = 슬라이드 검색어 → 공식 API → 기사 이미지 순
-    const braveCands = !isCover
-      ? await brave(`${topic.entity} ${slides[i].imageQuery}`, braveKey)
-      : [];
+    const braveCands = await brave(
+      `${topic.entity} ${slides[i].imageQuery || ""}`.trim(),
+      braveKey
+    );
 
-    const candidates = isCover
-      ? [...fromArticle, ...fromApi, ...braveCands]
-      : [...braveCands, ...fromApi, ...fromArticle];
+    const list = [
+      ...new Set(
+        (isCover
+          ? [...fromArticle, ...fromApi, ...braveCands]
+          : [...braveCands, ...fromApi, ...fromArticle]
+        ).filter((u) => u && !isBlockedImageUrl(u))
+      ),
+    ];
+    cands.push(list); // 텔레그램 "다음 후보 사진" 버튼에서 사용
 
     let got: Buffer | null = null;
     let selectedUrl = "";
 
-    for (const u of candidates) {
-      if (!u || usedUrl.has(u)) continue;
+    for (const u of list) {
+      if (usedUrl.has(u)) continue;
       const b = await downloadImage(u);
       if (!b) continue;
 
@@ -255,6 +300,8 @@ export async function pickSlideImages(
     }
   }
 
-  log?.(`✔ 총 ${bufs.filter(Boolean).length}장의 슬라이드 이미지가 배정되었습니다.`);
-  return { bufs, urls };
+  log?.(
+    `✔ ${bufs.filter(Boolean).length}장 배정 (후보 총 ${cands.flat().length}개)`
+  );
+  return { bufs, urls, cands };
 }

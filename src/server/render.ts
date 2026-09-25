@@ -101,7 +101,6 @@ export async function renderSlide(opts: SlideRenderOpts): Promise<Buffer> {
   const scale = Math.max(1.0, Math.min(2.5, opts.imageScale ?? st.imageScale ?? 1.0));
   const overlayAlpha = Math.max(0.1, Math.min(1.0, opts.overlayOpacity ?? st.overlayOpacity ?? 0.85));
   const imagePos = opts.imagePosition || st.imagePosition || "attention";
-  const offsetYPercent = opts.imageOffsetY ?? st.imageOffsetY ?? 50;
 
   const scaleFactor = W / 1080;
   const isSplitLayout = imgRatio < 0.94;
@@ -245,26 +244,32 @@ export async function renderSlide(opts: SlideRenderOpts): Promise<Buffer> {
           .composite([{ input: containedFg, gravity: "center" }])
           .toBuffer();
       } else {
-        // cover 모드 (확대 스케일 및 포지션 조절)
-        if (scale > 1.02) {
-          const scaledW = Math.round(W * scale);
-          const scaledH = Math.round(imgH * scale);
-          const offsetYNorm = offsetYPercent / 100;
-          const top = Math.max(0, Math.min(scaledH - imgH, Math.round((scaledH - imgH) * offsetYNorm)));
-          const left = Math.max(0, Math.round((scaledW - W) / 2));
-
-          processedImg = await sharp(img)
-            .resize(scaledW, scaledH, { fit: "cover" })
-            .extract({ left, top, width: W, height: imgH })
-            .toBuffer();
-        } else {
+        // cover 모드: 원본 이미지 전체 범위 안에서 확대하고 X/Y로 이동
+        const offX = st.imageOffsetX;
+        const offY = opts.imageOffsetY ?? st.imageOffsetY;
+        if (scale <= 1.02 && offX === undefined && offY === undefined) {
           let pos: any = sharp.strategy.attention;
           if (imagePos === "top") pos = sharp.gravity.north;
           else if (imagePos === "bottom") pos = sharp.gravity.south;
           else if (imagePos === "center") pos = sharp.gravity.center;
-
           processedImg = await sharp(img)
             .resize(W, imgH, { fit: "cover", position: pos })
+            .toBuffer();
+        } else {
+          const m = await sharp(img).metadata();
+          const iw = m.width || W,
+            ih = m.height || imgH;
+          const k = Math.max(W / iw, imgH / ih) * scale;
+          const rw = Math.max(W, Math.round(iw * k));
+          const rh = Math.max(imgH, Math.round(ih * k));
+          processedImg = await sharp(img)
+            .resize(rw, rh, { fit: "fill" })
+            .extract({
+              left: Math.round((rw - W) * ((offX ?? 50) / 100)),
+              top: Math.round((rh - imgH) * ((offY ?? 50) / 100)),
+              width: W,
+              height: imgH,
+            })
             .toBuffer();
         }
       }

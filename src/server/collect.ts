@@ -29,6 +29,7 @@ const parser = new Parser({
       ["media:content", "media"],
       ["media:thumbnail", "thumb"],
       ["content:encoded", "encoded"],
+      ["category", "atomCats", { keepArray: true }],
     ],
   },
 });
@@ -37,20 +38,32 @@ async function fromRss(
   s: Extract<(typeof SOURCES)[number], { kind: "rss" }>
 ): Promise<Article[]> {
   const feed = await parser.parseURL(s.url);
-  return feed.items.map((it: any) => ({
-    title: (it.title || "").trim(),
-    link: it.link || "",
-    date: Date.parse(it.isoDate || it.pubDate || "") || Date.now(),
-    snippet: (it.contentSnippet || it.summary || "").slice(0, 300),
-    source: s.name,
-    cat: s.cat,
-    images: [
-      it.enclosure?.url,
-      it.media?.$?.url,
-      it.thumb?.$?.url,
-      ...extractImgs(it.encoded || it.content || "", it.link),
-    ].filter(Boolean) as string[],
-  }));
+  const re = s.filter ? new RegExp(s.filter, "i") : null;
+  return feed.items
+    .filter((it: any) => {
+      if (!re) return true;
+      const cats = [
+        ...(it.categories ?? []),
+        ...(it.atomCats ?? []).map((c: any) => c?.$?.term ?? c?.$?.label ?? c),
+      ]
+        .filter((x: any) => typeof x === "string")
+        .join(" ");
+      return re.test(`${it.title} ${cats}`);
+    })
+    .map((it: any) => ({
+      title: (it.title || "").trim(),
+      link: it.link || "",
+      date: Date.parse(it.isoDate || it.pubDate || "") || Date.now(),
+      snippet: (it.contentSnippet || it.summary || "").slice(0, 300),
+      source: s.name,
+      cat: s.cat,
+      images: [
+        it.enclosure?.url,
+        it.media?.$?.url,
+        it.thumb?.$?.url,
+        ...extractImgs(it.encoded || it.content || "", it.link),
+      ].filter(Boolean) as string[],
+    }));
 }
 
 async function fromReddit(
@@ -63,23 +76,35 @@ async function fromReddit(
       signal: AbortSignal.timeout(10000),
     }
   );
-  if (!res.ok) throw new Error(`Reddit ${s.sub} returned status ${res.status}`);
-  const json: any = await res.json();
-  return (json.data?.children ?? [])
-    .map((c: any) => c.data)
-    .filter((d: any) => !d.stickied)
-    .map((d: any) => ({
-      title: d.title,
-      link: `https://www.reddit.com${d.permalink}`,
-      date: (d.created_utc || Date.now() / 1000) * 1000,
-      snippet: (d.selftext || d.url_overridden_by_dest || "").slice(0, 300),
-      source: `Reddit r/${s.sub}`,
-      cat: s.cat,
-      score: d.score,
-      images: (d.preview?.images ?? []).map((i: any) =>
-        (i.source?.url || "").replace(/&amp;/g, "&")
-      ).filter(Boolean),
-    }));
+  if (res.ok) {
+    const json: any = await res.json();
+    return (json.data?.children ?? [])
+      .map((c: any) => c.data)
+      .filter((d: any) => !d.stickied)
+      .map((d: any) => ({
+        title: d.title,
+        link: `https://www.reddit.com${d.permalink}`,
+        date: (d.created_utc || Date.now() / 1000) * 1000,
+        snippet: (d.selftext || d.url_overridden_by_dest || "").slice(0, 300),
+        source: `Reddit r/${s.sub}`,
+        cat: s.cat,
+        score: d.score,
+        images: (d.preview?.images ?? [])
+          .map((i: any) => (i.source?.url || "").replace(/&amp;/g, "&"))
+          .filter(Boolean),
+      }));
+  }
+  // 클라우드 IP 차단(403/429)이면 RSS로 한 번 더 시도
+  const feed = await parser.parseURL(`https://www.reddit.com/r/${s.sub}/top/.rss?t=day`);
+  return feed.items.map((it: any) => ({
+    title: (it.title || "").trim(),
+    link: it.link || "",
+    date: Date.parse(it.isoDate || "") || Date.now(),
+    snippet: (it.contentSnippet || "").slice(0, 300),
+    source: `Reddit r/${s.sub}`,
+    cat: s.cat,
+    images: extractImgs(it.content || "", it.link),
+  }));
 }
 
 // X 트렌드 및 최신 화제: Gemini + Google Search Grounding (쿼터 보호 캐시 탑재)
