@@ -1,0 +1,6 @@
+{
+  "name": "서브컬처 매거진 봇 (Subculture Auto-Magazine Bot)",
+  "description": "최신 애니메이션·게임·J-POP 뉴스를 자동 수집하고 Gemini로 기획하여 인스타그램 및 텔레그램용 고품질 카드뉴스로 제작하는 AI 매거진 스튜디오",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
